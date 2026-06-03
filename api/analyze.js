@@ -1,8 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
+module.exports = async function handler(req, res) {
+  // Allow CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-export default async function handler(req, res) {
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { image, mediaType, context } = req.body;
@@ -33,20 +35,15 @@ Return ONLY the JSON. No markdown, no explanation.`;
       max_tokens: 1024,
       messages: [{
         role: 'user',
-        content: [{
-          type: 'image',
-          source: { type: 'base64', media_type: mediaType, data: image },
-        }, {
-          type: 'text',
-          text: prompt,
-        }],
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: image } },
+          { type: 'text', text: prompt }
+        ],
       }],
     }),
   });
 
   const data = await response.json();
-  const text = data?.content?.[0]?.text || '';
+  const text = data?.content?.[0]?.text || '{}';
   res.status(200).send(text);
-}
-
-}
+};
