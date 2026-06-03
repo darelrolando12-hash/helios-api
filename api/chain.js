@@ -7,30 +7,47 @@ export default async function handler(req, res) {
   const { symbol, expiration } = req.query;
   if (!symbol) return res.status(400).json({ error: "symbol is required" });
 
-  // Convert "Jun 20" → "2025-06-20" format Polygon expects
   const months = {
-    Jan:"01", Feb:"02", Mar:"03", Apr:"04", May:"05", Jun:"06",
-    Jul:"07", Aug:"08", Sep:"09", Oct:"10", Nov:"11", Dec:"12"
+    Jan:"01",Feb:"02",Mar:"03",Apr:"04",May:"05",Jun:"06",
+    Jul:"07",Aug:"08",Sep:"09",Oct:"10",Nov:"11",Dec:"12"
   };
+
   let expDate = "";
   if (expiration) {
     const [mon, day] = expiration.split(" ");
     const year = new Date().getFullYear();
-    expDate = `${year}-${months[mon] || "06"}-${String(day).padStart(2, "0")}`;
+    expDate = `${year}-${months[mon] || "06"}-${String(day).padStart(2,"0")}`;
   }
 
+  const key = process.env.POLYGON_API_KEY;
+
+  // Use the options contracts endpoint (Starter plan+)
   const params = new URLSearchParams({
-    apiKey: process.env.POLYGON_API_KEY,
+    apiKey: key,
     limit: "250",
+    contract_type: "call",
+    ...(expDate && { expiration_date: expDate }),
+  });
+  const params2 = new URLSearchParams({
+    apiKey: key,
+    limit: "250",
+    contract_type: "put",
     ...(expDate && { expiration_date: expDate }),
   });
 
-  const url = `https://api.polygon.io/v3/snapshot/options/${symbol.toUpperCase()}?${params}`;
-
   try {
-    const r = await fetch(url);
-    const data = await r.json();
-    res.status(r.status).json(data);
+    const sym = symbol.toUpperCase();
+    const [callRes, putRes] = await Promise.all([
+      fetch(`https://api.polygon.io/v3/snapshot/options/${sym}?${params}`),
+      fetch(`https://api.polygon.io/v3/snapshot/options/${sym}?${params2}`),
+    ]);
+    const [callData, putData] = await Promise.all([callRes.json(), putRes.json()]);
+
+    const results = [
+      ...(callData.results || []),
+      ...(putData.results || []),
+    ];
+    res.json({ results, status: "OK" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
