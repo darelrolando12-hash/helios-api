@@ -64,8 +64,6 @@ Rules:
     });
 
     const text = response.content[0].text.trim();
-
-    // Strip markdown code fences if Claude wraps the JSON
     const cleaned = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
 
     let result;
@@ -76,11 +74,6 @@ Rules:
     }
 
     return res.status(200).json(result);
-  } catch (err) {
-    console.error('Analyze error:', err);
-    return res.status(500).json({ error: err.message || 'Analysis failed' });
-  }
-}    return res.status(200).json(result);
   } catch (err) {
     console.error('Analyze error:', err);
     return res.status(500).json({ error: err.message || 'Analysis failed' });
