@@ -80,4 +80,9 @@ Rules:
     console.error('Analyze error:', err);
     return res.status(500).json({ error: err.message || 'Analysis failed' });
   }
+}    return res.status(200).json(result);
+  } catch (err) {
+    console.error('Analyze error:', err);
+    return res.status(500).json({ error: err.message || 'Analysis failed' });
+  }
 }
