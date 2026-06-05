@@ -1,43 +1,24 @@
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol } = req.query;
-  if (!symbol) return res.status(400).json({ error: 'Missing symbol' });
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
 
-  const sym = symbol.toUpperCase().trim();
+  const key = process.env.POLYGON_API_KEY;
+  if (!key) return res.status(500).json({ error: 'POLYGON_API_KEY not set' });
+
+  const to = new Date().toISOString().split('T')[0];
+  const from = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+  const url = `https://api.polygon.io/v2/aggs/ticker/${symbol.toUpperCase()}/range/1/day/${from}/${to}?adjusted=true&sort=asc&limit=10&apiKey=${key}`;
 
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=5d`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json',
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Yahoo Finance returned ${response.status}`);
-    }
-
-    const data = await response.json();
-    const result = data?.chart?.result?.[0];
-
-    if (!result) {
-      throw new Error(`No data found for ${sym}`);
-    }
-
-    const closes = result.indicators?.quote?.[0]?.close ?? [];
-    const prices = closes
-      .filter((p) => p !== null && p !== undefined && !isNaN(p))
-      .map((p) => parseFloat(p.toFixed(2)));
-
-    return res.status(200).json({ symbol: sym, prices });
+    const r = await fetch(url);
+    const data = await r.json();
+    const prices = (data.results || []).map(b => b.c);
+    res.json({ symbol: symbol.toUpperCase(), prices });
   } catch (err) {
-    console.error(`Sparkline error for ${sym}:`, err);
-    return res.status(500).json({ error: err.message || 'Failed to fetch sparkline' });
+    res.status(500).json({ error: err.message ?? 'Fetch failed' });
   }
 }
