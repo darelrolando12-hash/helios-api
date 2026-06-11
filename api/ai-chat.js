@@ -1,5 +1,4 @@
 module.exports = async function handler(req, res) {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -16,14 +15,9 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  // Build system prompt with live market context
   const systemPrompt = buildSystemPrompt(context ?? {});
-
-  // Determine token budget: deep analysis gets more, voice gets less
   const isDeepAnalysis = !!(context?.systemOverride);
   const maxTokens = isDeepAnalysis ? 800 : 350;
-
-  // Convert messages to Anthropic format (role must alternate user/assistant)
   const claudeMessages = normalizeMessages(messages);
 
   try {
@@ -57,12 +51,10 @@ module.exports = async function handler(req, res) {
 
     const data = await response.json();
     const rawText = data.content?.[0]?.text ?? '';
-
     if (!rawText) {
       return res.status(500).json({ error: 'No response from AI' });
     }
 
-    // Intent parsing: detect navigation / action commands in Claude's reply
     const intent = parseIntent(rawText, messages);
     if (intent) {
       return res.status(200).json({
@@ -81,11 +73,9 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ─── Normalize message history for Claude ─────────────────────────────────────
 function normalizeMessages(messages) {
   const filtered = messages.filter(m => m.role === 'user' || m.role === 'assistant');
   if (filtered.length === 0) return [];
-
   const result = [];
   for (const msg of filtered) {
     const last = result[result.length - 1];
@@ -95,21 +85,15 @@ function normalizeMessages(messages) {
       result.push({ role: msg.role, content: msg.content });
     }
   }
-
-  // Claude requires first message to be user
   if (result[0]?.role !== 'user') {
     result.unshift({ role: 'user', content: 'Hello' });
   }
-
-  // Keep last 10 messages to control token usage
   return result.slice(-10);
 }
 
-// ─── Intent parser ─────────────────────────────────────────────────────────────
 function parseIntent(aiReply, messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user')?.content?.toLowerCase() ?? '';
 
-  // Navigation intents
   const navMap = {
     dashboard:  ['dashboard', 'home', 'overview'],
     scanner:    ['scanner', 'scan', 'intraday'],
@@ -120,6 +104,7 @@ function parseIntent(aiReply, messages) {
     brain:      ['brain', 'helios brain', 'ghost'],
     settings:   ['settings', 'preferences'],
   };
+
   for (const [page, keywords] of Object.entries(navMap)) {
     if (keywords.some(k => lastUser.includes(k) && (
       lastUser.includes('go to') || lastUser.includes('open') ||
@@ -131,30 +116,25 @@ function parseIntent(aiReply, messages) {
     }
   }
 
-  // Add to watchlist
   const watchMatch = lastUser.match(/add\s+([A-Z]{1,5})\s+to\s+(?:my\s+)?watchlist/i);
   if (watchMatch) {
     return { name: 'add_watchlist', args: { ticker: watchMatch[1].toUpperCase() } };
   }
 
-  // Set price alert
   const alertMatch = lastUser.match(/(?:set|create|add)\s+(?:an?\s+)?alert\s+(?:for\s+)?([A-Z]{1,5})\s+(?:at|when|if)?\s*\$?([\d.]+)/i);
   if (alertMatch) {
     const dir = lastUser.includes('below') || lastUser.includes('drops') ? 'below' : 'above';
     return { name: 'set_alert', args: { ticker: alertMatch[1].toUpperCase(), price: parseFloat(alertMatch[2]), direction: dir } };
   }
 
-  // Show best contracts
   if (/best contracts?|top picks?|what should i trade|show.{0,10}picks/i.test(lastUser)) {
     return { name: 'show_best_contracts', args: {} };
   }
 
-  // Show market bias
   if (/market bias|market overview|how.{0,10}market|market direction/i.test(lastUser)) {
     return { name: 'show_market_bias', args: {} };
   }
 
-  // Analyze ticker
   const analyzeMatch = lastUser.match(/(?:analyze|analysis|tell me about|check|look at)\s+([A-Z]{1,5})\b/i);
   if (analyzeMatch) {
     return { name: 'analyze_ticker', args: { ticker: analyzeMatch[1].toUpperCase(), focus: 'full' } };
@@ -163,7 +143,6 @@ function parseIntent(aiReply, messages) {
   return null;
 }
 
-// ─── System prompt ─────────────────────────────────────────────────────────────
 function buildSystemPrompt(context) {
   const {
     marketBias, topSignals, activeTrades, watchlist, bestContracts,
@@ -171,7 +150,6 @@ function buildSystemPrompt(context) {
     systemOverride,
   } = context;
 
-  // Allow Ask Helios deep analysis to supply its own focused system prompt
   if (systemOverride) return systemOverride;
 
   const now = time ? new Date(time) : new Date();
@@ -209,7 +187,7 @@ function buildSystemPrompt(context) {
 
   const signalsDetail = topSignals?.length
     ? topSignals.slice(0, 3).map(s => {
-        const age = s.ageMinutes !== undefined ? ` (${s.ageMinutes}m old)` : '';
+        const age = s.ageMinutes !== undefined ? `(${s.ageMinutes}m old)` : '';
         return `${s.symbol} ${s.signal.toUpperCase()} (${s.conviction}% conviction${age})`;
       }).join(', ')
     : 'no fresh signals';
