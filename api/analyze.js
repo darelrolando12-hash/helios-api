@@ -95,25 +95,4 @@ Respond ONLY with valid JSON. No markdown fences.`;
   } catch (err) {
     return res.status(500).json({ error: err.message || 'Analysis failed' });
   }
-};    if (!response.ok) {
-      const err = await response.text();
-      return res.status(response.status).json({ error: `Claude API error: ${err}` });
-    }
-
-    const data = await response.json();
-    const text = data.content?.[0]?.text ?? '';
-
-    // Parse JSON from response
-    let parsed;
-    try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text);
-    } catch {
-      parsed = { raw: text, bias: 'neutral', conviction: 5, summary: text };
-    }
-
-    res.json(parsed);
-  } catch (err) {
-    res.status(500).json({ error: err.message ?? 'Unknown error' });
-  }
-}
+};
