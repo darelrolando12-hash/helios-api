@@ -55,7 +55,7 @@ Respond ONLY with valid JSON. No markdown fences.`;
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-3-5-sonnet-latest',
+        model: 'claude-haiku-4-5',
         max_tokens: 1200,
         messages: [{
           role: 'user',
