@@ -236,16 +236,4 @@ module.exports = async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message || 'Quote fetch failed' });
   }
-};    return res.status(200).json({
-      symbol: sym, price, change, changePct,
-      high: meta.regularMarketDayHigh ?? null, low: meta.regularMarketDayLow ?? null,
-      open: meta.regularMarketOpen ?? null, prevClose,
-      volume: meta.regularMarketVolume ?? 0,
-      name: meta.shortName ?? meta.longName ?? sym,
-      week52High: meta.fiftyTwoWeekHigh ?? null, week52Low: meta.fiftyTwoWeekLow ?? null,
-      source: 'yahoo',
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message || 'Quote fetch failed' });
-  }
 };
