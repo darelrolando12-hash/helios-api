@@ -7,7 +7,7 @@ module.exports = async function handler(req, res) {
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: 'AI not configured. Add ANTHROPIC_API_KEY to Vercel environment variables.' });
+    return res.status(500).json({ error: 'AI not configured. Add ANTHROPIC_API_KEY to Vercel.' });
   }
 
   const { messages, context } = req.body ?? {};
@@ -15,9 +15,11 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
+  const mode = context?.mode ?? 'chat';
+  const isDeep = mode === 'deep_analysis' || mode === 'post_trade_autopsy' || mode === 'scenario_planner';
+  const maxTokens = isDeep ? 900 : mode === 'morning-briefing' ? 700 : 450;
+
   const systemPrompt = buildSystemPrompt(context ?? {});
-  const isDeepAnalysis = !!(context && context.systemOverride);
-  const maxTokens = isDeepAnalysis ? 800 : 350;
   const claudeMessages = normalizeMessages(messages);
 
   try {
@@ -39,43 +41,27 @@ module.exports = async function handler(req, res) {
     if (!response.ok) {
       const errText = await response.text();
       console.error('[ai-chat] Anthropic error:', response.status, errText);
-      const isAuthError = response.status === 401;
-      const isOverloaded = response.status === 529 || response.status === 503;
-      const msg = isAuthError
-        ? 'AI not configured. Check ANTHROPIC_API_KEY in Vercel environment variables.'
-        : isOverloaded
-        ? 'AI service is busy. Try again in a moment.'
-        : 'AI service error: ' + response.status + ' — ' + errText.slice(0, 120);
-      return res.status(500).json({ error: msg });
+      return res.status(response.status).json({ error: 'AI service error: ' + response.status });
     }
 
     const data = await response.json();
-    const rawText = (data.content && data.content[0] && data.content[0].text) ? data.content[0].text : '';
-    if (!rawText) {
-      return res.status(500).json({ error: 'No response from AI' });
-    }
+    const text = data?.content?.[0]?.text ?? '';
+    const intent = parseIntent(text, messages);
 
-    const intent = parseIntent(rawText, messages);
-    if (intent) {
-      return res.status(200).json({
-        type: 'function',
-        functionName: intent.name,
-        functionArgs: intent.args,
-        text: null,
-      });
-    }
-
-    return res.status(200).json({ type: 'text', text: rawText, functionName: null, functionArgs: null });
-
+    return res.status(200).json({ text, intent });
   } catch (err) {
-    console.error('[ai-chat] error:', err);
-    return res.status(500).json({ error: 'AI unavailable. Check your connection.' });
+    console.error('[ai-chat] Error:', err);
+    return res.status(500).json({ error: 'AI request failed' });
   }
 };
 
+// ─── Normalize messages ───────────────────────────────────────────────────────
+
 function normalizeMessages(messages) {
-  const filtered = messages.filter(function(m) { return m.role === 'user' || m.role === 'assistant'; });
-  if (filtered.length === 0) return [];
+  var filtered = messages.filter(function(m) {
+    return m && (m.role === 'user' || m.role === 'assistant') &&
+           typeof m.content === 'string' && m.content.trim().length > 0;
+  });
   var result = [];
   for (var i = 0; i < filtered.length; i++) {
     var msg = filtered[i];
@@ -89,23 +75,26 @@ function normalizeMessages(messages) {
   if (result[0] && result[0].role !== 'user') {
     result.unshift({ role: 'user', content: 'Hello' });
   }
-  return result.slice(-10);
+  return result.slice(-12);
 }
 
+// ─── Intent parsing ───────────────────────────────────────────────────────────
+
 function parseIntent(aiReply, messages) {
+  void aiReply;
   var reversed = messages.slice().reverse();
   var lastUserMsg = reversed.find(function(m) { return m.role === 'user'; });
   var lastUser = (lastUserMsg && lastUserMsg.content) ? lastUserMsg.content.toLowerCase() : '';
 
   var navMap = {
-    dashboard:  ['dashboard', 'home', 'overview'],
-    scanner:    ['scanner', 'scan', 'intraday'],
-    signals:    ['signals', 'signal feed', 'elite plays'],
-    journal:    ['journal', "i'm in", 'trades', 'paper trade'],
-    options:    ['options', 'options chain', 'chain'],
-    chart:      ['chart scan', 'chart', 'chart analysis'],
-    brain:      ['brain', 'helios brain', 'ghost'],
-    settings:   ['settings', 'preferences'],
+    dashboard: ['dashboard', 'home', 'overview'],
+    scanner: ['scanner', 'scan', 'intraday'],
+    signals: ['signals', 'signal feed', 'elite plays'],
+    journal: ['journal', "i'm in", 'trades', 'paper trade'],
+    options: ['options', 'options chain', 'chain'],
+    chart: ['chart scan', 'chart', 'chart analysis'],
+    brain: ['brain', 'helios brain', 'ghost'],
+    settings: ['settings', 'preferences'],
   };
 
   var pages = Object.keys(navMap);
@@ -122,9 +111,7 @@ function parseIntent(aiReply, messages) {
   }
 
   var watchMatch = lastUser.match(/add\s+([A-Z]{1,5})\s+to\s+(?:my\s+)?watchlist/i);
-  if (watchMatch) {
-    return { name: 'add_watchlist', args: { ticker: watchMatch[1].toUpperCase() } };
-  }
+  if (watchMatch) return { name: 'add_watchlist', args: { ticker: watchMatch[1].toUpperCase() } };
 
   var alertMatch = lastUser.match(/(?:set|create|add)\s+(?:an?\s+)?alert\s+(?:for\s+)?([A-Z]{1,5})\s+(?:at|when|if)?\s*\$?([\d.]+)/i);
   if (alertMatch) {
@@ -132,78 +119,318 @@ function parseIntent(aiReply, messages) {
     return { name: 'set_alert', args: { ticker: alertMatch[1].toUpperCase(), price: parseFloat(alertMatch[2]), direction: dir } };
   }
 
+  if (/best contracts?|top picks?|what should i trade|show.{0,10}picks/i.test(lastUser)) {
+    return { name: 'show_best_contracts', args: {} };
+  }
+
+  var analyzeMatch = lastUser.match(/(?:analyze|analysis|tell me about|check|look at)\s+([A-Z]{1,5})\b/i);
+  if (analyzeMatch) {
+    return { name: 'analyze_ticker', args: { ticker: analyzeMatch[1].toUpperCase(), focus: 'full' } };
+  }
+
   return null;
 }
 
-function buildSystemPrompt(context) {
-  var {
-    session, marketBias, activeTrades, bestContracts,
-    brainStats, watchlist, accountSize, riskTolerance,
-    tradeHistory, topSignals,
-  } = context;
+// ─── System prompt builder — ALL 7 LAYERS ────────────────────────────────────
 
-  var tradesDetail = (activeTrades && activeTrades.length)
+function buildSystemPrompt(context) {
+  var mode         = context.mode ?? 'chat';
+  var time         = context.time;
+  var marketBias   = context.marketBias;
+  var topSignals   = context.topSignals ?? [];
+  var activeTrades = context.activeTrades ?? [];
+  var watchlist    = context.watchlist ?? [];
+  var bestContracts= context.bestContracts ?? [];
+  var ghostStats   = context.ghostStats;
+  var brainStats   = context.brainStats;
+  var newsHeadlines= context.newsHeadlines ?? [];
+  var accountSize  = context.accountSize;
+  var riskTolerance= context.riskTolerance;
+  var tradeHistory = context.tradeHistory;
+  // Super-agent layers
+  var liveMarket   = context.liveMarket   ?? '';
+  var traderFP     = context.traderFP     ?? '';
+  var macroIntel   = context.macroIntel   ?? '';
+  var brainCombos  = context.brainCombos  ?? '';
+  var disciplineCtx= context.disciplineCtx ?? '';
+  var activeCtx    = context.activeCtx    ?? '';
+
+  var now    = time ? new Date(time) : new Date();
+  var ctDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+  var ctHour = ctDate.getHours();
+  var ctMin  = ctDate.getMinutes();
+  var session =
+    ctHour < 8  ? 'Pre-Market (4:00–9:30 CT)' :
+    ctHour < 9 || (ctHour === 9 && ctMin < 30) ? 'Pre-Market (4:00–9:30 CT)' :
+    ctHour < 10 ? 'Market Open 9:30–10:00 CT — HIGHEST volatility, best momentum entries' :
+    ctHour < 11 ? 'Morning 10:00–11:00 CT — trend confirmation window' :
+    ctHour < 12 ? 'Mid-Morning 11:00–12:00 CT — momentum plays still viable' :
+    ctHour < 13 ? 'Midday 12:00–13:00 CT — chop zone, reduce size, wait for break' :
+    ctHour < 14 ? 'Afternoon 13:00–14:00 CT — watch for trend continuation or reversal setup' :
+    ctHour < 15 ? 'Power Hour 14:00–15:00 CT — institutional close activity, elevated volume' :
+    ctHour < 16 ? 'Final 30min 15:00–16:00 CT — market on close orders, high risk' :
+    'After Hours — no new options entries recommended';
+
+  // ── Trade detail ─────────────────────────────────────────────────────────────
+  var tradesDetail = activeTrades.length
     ? activeTrades.map(function(t) {
-        return t.symbol + ' ' + t.direction.toUpperCase() +
-          ' $' + t.strike + ' exp ' + t.expiry +
-          ' | entry $' + t.entryPremium.toFixed(2) +
-          ' | now $' + t.currentPremium.toFixed(2) +
-          ' | P&L ' + (t.pnlPct >= 0 ? '+' : '') + t.pnlPct.toFixed(1) + '%' +
-          ' | held ' + t.minutesHeld + 'm';
+        var pnl    = (t.pnlPct > 0 ? '+' : '') + t.pnlPct.toFixed(1) + '%';
+        var held   = t.minutesHeld != null ? t.minutesHeld + 'm held' : '';
+        var strike = t.strike  ? '$' + t.strike  : '';
+        var expiry = t.expiry  ? 'exp ' + t.expiry : '';
+        var tiers  = t.exitTiersHit ? t.exitTiersHit + ' tiers hit' : '0 tiers hit';
+        var hwm    = t.highWaterMark ? ' | max: +' + t.highWaterMark.toFixed(0) + '%' : '';
+        return [t.symbol, t.direction ? t.direction.toUpperCase() : '', strike, expiry, pnl, held, tiers + hwm].filter(Boolean).join(' | ');
       }).join('\n')
     : 'No active trades';
 
-  var contractsDetail = (bestContracts && bestContracts.length)
-    ? bestContracts.slice(0, 3).map(function(c) {
-        return c.symbol + ' ' + c.direction.toUpperCase() +
-          ' $' + c.strike + ' exp ' + c.expiry +
-          ' | score ' + c.engineScore +
-          ' | premium $' + c.premium.toFixed(2);
-      }).join('\n')
-    : 'No contracts loaded';
-
-  var brainDetail = brainStats
-    ? 'Win rate: ' + brainStats.winRate + '% | Elite rate: ' + brainStats.eliteRate + '% | Total trades: ' + brainStats.totalTrades
-    : 'Brain not loaded';
-
-  var profileDetail = accountSize
-    ? 'Account: $' + Number(accountSize).toLocaleString() + ', risk: ' + (riskTolerance || 'moderate')
-    : 'No account size set';
-
-  var historyDetail = tradeHistory
-    ? 'Personal history: ' + tradeHistory.winRate + '% win rate across ' + tradeHistory.totalTrades + ' trades, avg gain ' + tradeHistory.avgGain + '%'
-    : 'No trade history yet';
-
-  var signalsDetail = (topSignals && topSignals.length)
-    ? topSignals.slice(0, 3).map(function(s) {
-        var age = s.ageMinutes !== undefined ? ' (' + s.ageMinutes + 'm old)' : '';
-        return s.symbol + ' ' + s.signal.toUpperCase() + ' (' + s.conviction + '% conviction' + age + ')';
+  var contractsDetail = bestContracts.length
+    ? bestContracts.map(function(c) {
+        return c.symbol + ' ' + c.direction.toUpperCase() + ' $' + c.strike + ' exp ' + c.expiry + ' (score ' + c.score + ')';
       }).join(', ')
-    : 'no fresh signals';
+    : 'none loaded';
 
-  var watchlistStr = (watchlist && watchlist.length) ? watchlist.join(', ') : 'empty';
-  var signalsLine = (topSignals && topSignals.length) ? '- Top signals: ' + signalsDetail : '';
+  var brainLines = [];
+  if (ghostStats) brainLines.push('Ghost: ' + ghostStats.overallAccuracy + '% accuracy, ' + ghostStats.sessionAccuracy + '% recent');
+  if (brainStats && brainStats.totalTrades > 0) {
+    brainLines.push('Your Brain: ' + brainStats.winRate + '% win rate | ' + brainStats.eliteRate + '% elite (100%+) | ' + brainStats.totalTrades + ' trades');
+    if (brainStats.bestSession) brainLines.push('Best session: ' + brainStats.bestSession);
+  }
 
-  return 'You are Helios, an elite AI trading assistant inside the Helios options analysis platform.\n' +
-    'Personality: Confident, sharp, direct. You sound like an experienced trader, not a financial advisor. Never hype, never guarantee results.\n' +
-    'Always frame things as analysis and education, never as financial advice.\n\n' +
-    'LIVE MARKET CONTEXT:\n' +
-    '- Session: ' + session + ' CT\n' +
-    '- Market bias: ' + (marketBias || 'checking...') + '\n' +
-    '- Watchlist: ' + watchlistStr + '\n' +
-    signalsLine + '\n\n' +
-    'ACTIVE TRADES (REAL-TIME):\n' + tradesDetail + '\n\n' +
-    'BEST CONTRACTS NOW:\n' + contractsDetail + '\n\n' +
-    'GHOST BRAIN INTELLIGENCE:\n' + brainDetail + '\n\n' +
-    'USER PROFILE:\n' + profileDetail + '\n' + historyDetail + '\n\n' +
-    'CRITICAL RULES:\n' +
-    '1. Keep responses SHORT — under 3 sentences for voice. Never ramble.\n' +
-    '2. When user asks "should I exit [ticker]?" check active trade P&L and give a data-driven answer.\n' +
-    '3. When user asks "what should I trade?" reference best contracts with actual scores.\n' +
-    '4. If user asks about entry timing, check session (avoid entries after 14:00 CT) and signal freshness.\n' +
-    '5. NEVER make up data. Use the context above or say "let me check the scanner".\n' +
-    '6. Always mention risk when discussing trades.\n' +
-    '7. Speak naturally — this is voice, not chat. Use contractions, be human.\n' +
-    '8. If data is stale, tell user to refresh the scanner first.\n' +
-    '9. When signal age is over 30 minutes, warn: "That signal is a bit old, double-check the chart before entry."';
+  var newsLines = newsHeadlines.length
+    ? newsHeadlines.slice(0, 6).map(function(n) {
+        var tick = n.ticker || '';
+        var sent = n.sentiment || 'neutral';
+        var head = n.headline || n.title || '';
+        return tick + ' [' + sent + ']: ' + head.slice(0, 80);
+      }).join('\n')
+    : 'No headlines loaded';
+
+  var watchlistStr = watchlist.length ? watchlist.join(', ') : 'AAPL, TSLA, SPY, QQQ, NVDA';
+
+  var signalsDetail = topSignals.length
+    ? topSignals.map(function(s) {
+        var age = s.ageMinutes > 0 ? ' (' + s.ageMinutes + 'm ago)' : '';
+        return s.symbol + ' → ' + s.signal.toUpperCase() + ' | ' + s.conviction + '% conviction | ' + (s.changePct >= 0 ? '+' : '') + s.changePct.toFixed(2) + '%' + age;
+      }).join('\n')
+    : 'No signals loaded yet';
+
+  var profileDetail = [
+    accountSize ? 'Account size: $' + accountSize : '',
+    riskTolerance ? 'Risk tolerance: ' + riskTolerance : '',
+    tradeHistory ? 'Trade history note: ' + tradeHistory : '',
+  ].filter(Boolean).join(' | ') || 'Profile not set';
+
+  // ══════════════════════════════════════════════════════════════════
+  // LAYER 4: PERMANENT OPTIONS KNOWLEDGE BASE
+  // ══════════════════════════════════════════════════════════════════
+  var optionsKnowledge = [
+    '═══════════════════════════════════════════════════════════════════',
+    'HELIOS SUPER-AGENT — PROFESSIONAL OPTIONS TRADING KNOWLEDGE BASE',
+    'This is your permanent expert foundation. Apply this to every answer.',
+    '═══════════════════════════════════════════════════════════════════',
+    '',
+    '── THE GREEKS (master these — they govern every options trade) ──────',
+    'DELTA: Probability proxy + directional exposure.',
+    '  0.50 = ATM (50% chance ITM). 0.70 = ITM (safer, lower ROI). 0.30 = OTM (higher ROI, needs bigger move).',
+    '  CALL delta is positive (profits on up moves). PUT delta is negative (profits on down moves).',
+    '  Rule: ATM options (delta 0.45–0.55) offer the best balance of cost vs. directional exposure.',
+    '',
+    'GAMMA: Rate of change of delta — how fast your option accelerates or decelerates.',
+    '  Highest near ATM, highest near expiry. 0DTE ATM options have extreme gamma after 1pm CT.',
+    '  High gamma = small price moves create large P&L swings. Double-edged sword.',
+    '  Rule: High gamma = lottery ticket behavior. Size smaller on high-gamma trades.',
+    '',
+    'THETA: Time decay — your option loses value every minute. Your enemy on long trades.',
+    '  0DTE: Theta is catastrophic after 12pm CT — position loses 2–5% per hour in pure time value.',
+    '  1-7 DTE: Theta moderate. 14-30 DTE: Theta slow — more time for the thesis to play out.',
+    '  Rule: On 0DTE, enter with a thesis and exit within 30-60 minutes. Dead money is dead.',
+    '',
+    'VEGA: Exposure to IV changes. Long options = long vega (benefit from IV expansion).',
+    '  When VIX spikes, long options gain value even if price stays flat.',
+    '  After a catalyst resolves (earnings, FOMC), IV collapses 40–70% — this is IV crush.',
+    '  Rule: Buy options BEFORE IV expands, never after. IV Rank > 80 = options overpriced.',
+    '',
+    'GAMMA-THETA tradeoff: More gamma (higher profit potential) = more theta (faster decay).',
+    '  0DTE plays are high-gamma, high-theta: must work fast or decay kills you.',
+    '',
+    '── IV (IMPLIED VOLATILITY) — THE OPTIONS MARKET\'S FEAR GAUGE ────────',
+    'IV Rank 0–20: Options are CHEAP. Favors buying outright calls/puts. Best long option environment.',
+    'IV Rank 20–50: Normal. Standard sizing and strategy.',
+    'IV Rank 50–75: Elevated. Reduce size 20-30%. Consider spreads instead of naked buys.',
+    'IV Rank 75–100: EXPENSIVE. Selling premium (spreads, iron condors) has statistical edge. Avoid naked buys.',
+    '',
+    'IV CRUSH (most common rookie killer):',
+    '  Buying options INTO earnings = buying at peak IV. Even if direction is right, IV collapses after.',
+    '  Example: NVDA earnings up 5% → options bought pre-earnings DOWN 30% because IV dropped 60%.',
+    '  Rule: Unless the expected move is 2× the priced move, never buy options into earnings.',
+    '  Best earnings play: Buy options 2+ weeks AFTER earnings (low IV), before the next catalyst.',
+    '',
+    '── OPTIONS PRICING FUNDAMENTALS ──────────────────────────────────────',
+    'Option premium = Intrinsic Value + Extrinsic Value (time + IV premium)',
+    'ATM options: 100% extrinsic value — you are paying for time and probability only.',
+    'ITM options: Mix of intrinsic + extrinsic. Acts more like stock. Less lottery, more conviction play.',
+    'OTM options: 100% extrinsic. High risk, needs large move. Only use with very high conviction.',
+    'Deep OTM options (delta < 0.20): Lottery tickets. >85% expire worthless. Avoid unless 90%+ conviction.',
+    '',
+    'BREAKEVEN MATH: (Strike + Premium Paid) for calls, (Strike - Premium Paid) for puts.',
+    'If you pay $2.00 for a $150 call, the stock must be above $152.00 at expiry to profit.',
+    'Rule: Always know your breakeven BEFORE entering. If breakeven requires a 3%+ move on 0DTE, think hard.',
+    '',
+    '── STRATEGY ARCHETYPES (when to use each) ────────────────────────────',
+    'DIRECTIONAL MOMENTUM (best for Helios signals):',
+    '  Buy ATM or slight OTM call/put, 0-7 DTE. Enter on confirmed signal.',
+    '  Target: 50%–100% gain. Stop: -25% to -30%. Never hold to expiry on 0DTE.',
+    '  Best in: MORNING session (9:30–10:30 CT) or POWER HOUR (14:00–15:00 CT).',
+    '',
+    'SWING TRADE (multi-day thesis):',
+    '  Buy ITM or ATM, 14–30 DTE. Less theta risk, more time for thesis.',
+    '  Target: 30%–80% gain. Stop: -30% to -40%.',
+    '  Best in: Low IV environments. Check earnings — do NOT hold through earnings.',
+    '',
+    'VERTICAL SPREAD (defined risk, high IV environment):',
+    '  Buy lower strike, sell higher strike (call debit spread). Max profit = spread width - cost.',
+    '  Cheaper than naked call, capped upside. Use when IV Rank > 60.',
+    '  Best for: "I think it moves, but not 5%+ in one day."',
+    '',
+    'STRADDLE (non-directional catalyst play):',
+    '  Buy ATM call + ATM put. Profits from large move in either direction.',
+    '  Needs the actual move to EXCEED the priced implied move to profit.',
+    '  Rule: Only buy straddles when you expect a surprise, and IV is not already inflated.',
+    '',
+    '── PATTERN RECOGNITION (what Helios detects) ─────────────────────────',
+    'VWAP RECLAIM: Price was below VWAP, reclaims on volume → CALL entry signal.',
+    '  Institutional buying often enters on VWAP test. High probability continuation.',
+    '',
+    'GAP-AND-FAIL (trap): Stock gaps up at open, then fades below the gap → PUT signal.',
+    '  "Fake gap" — no follow-through. Sellers overwhelm buyers. Fast PUT play.',
+    '',
+    'BULL FLAG: Strong move up, tight consolidation, then breakout → CALL entry.',
+    '  Volume decreases on consolidation, expands on breakout. Measured target = prior pole.',
+    '',
+    'EXHAUSTION / CLIMAX: Extreme volume + long wick candle → reversal likely.',
+    '  "Everything that could buy has bought" — reversal imminent.',
+    '',
+    'OPENING RANGE BREAKOUT: Defines the first 15-30 min high/low as key levels.',
+    '  Break above opening range high on volume → CALL. Break below → PUT.',
+    '  High probability play, especially on SPY/QQQ/high-cap stocks.',
+    '',
+    'HEAD AND SHOULDERS: Distribution topping pattern → PUT setup.',
+    '  Left shoulder → head (new high, less volume) → right shoulder (fails at prior high) → neckline break.',
+    '',
+    'MOMENTUM FADE: Signal was strong, price moved in your favor, now decelerating.',
+    '  "First sign of weakness after a big move" → exit, do not wait for reversal to confirm.',
+    '',
+    '── RISK MANAGEMENT RULES (non-negotiable) ────────────────────────────',
+    '1. POSITION SIZING: Never risk more than 2–5% of account on a single options trade.',
+    '   $10,000 account → max $200–$500 at risk per trade (this is your stop-loss dollar amount).',
+    '2. STOP LOSSES: Options move fast. Hard stop at -25% (0DTE), -30% (1-7 DTE), -35% (swing).',
+    '3. SCALE OUT RULE: At +50% gain, take 30-50% off. Let rest ride with a trailing stop.',
+    '   "Free trade" concept: If you take half off at +100%, your remaining position cost you nothing.',
+    '4. EARNINGS RULE: Never hold options through earnings unless you are selling premium.',
+    '5. CORRELATION RULE: 3+ calls in same sector = ONE directional trade in disguise. Size accordingly.',
+    '6. THETA RULE: On 0DTE, exit by 2:30pm CT unless clearly profitable. Theta is exponential near close.',
+    '7. OVERTRADING RULE: More than 5 trades/day = decision fatigue. Stop after 3 losses in a day.',
+    '8. IV RULE: Never buy options with IV Rank > 80 without a very strong catalyst. You are overpaying.',
+    '9. NEWS RULE: A rumor-driven gap reacts differently from a confirmed-news gap. Confirm the source.',
+    '10. VWAP RULE: Never buy calls below VWAP. Never buy puts above VWAP. Wait for the right side.',
+    '',
+    '── SESSION TIMING (professional edge) ────────────────────────────────',
+    'MARKET OPEN 9:30–10:00 CT: Highest volatility. Institutional orders hit. Best momentum entries.',
+    '  Wait 5–15 minutes for the "open chaos" to settle before entering.',
+    'MID-MORNING 10:00–11:30 CT: Trend confirms. Add to winners. Best signal quality.',
+    'MIDDAY 11:30–13:30 CT: Volume dries up. Chop. Reduce position size 50%. Avoid new entries.',
+    'AFTERNOON 13:30–14:00 CT: Institutions start positioning for close. Breakouts from midday range.',
+    'POWER HOUR 14:00–15:00 CT: Elevated volume, end-of-day institutional activity.',
+    '  Strong trending days continue. Weak days may reverse. High-probability continuation setups.',
+    'FINAL 30MIN 15:00–15:30 CT: MOC orders, unwinding. Very high risk. Do not initiate new trades.',
+    '',
+    '── OPTIONS EXPIRATION (OpEx) DYNAMICS ───────────────────────────────',
+    'OpEx = 3rd Friday of each month (monthly) + every Friday (0DTE weekly).',
+    'Gamma exposure (GEX): Market makers hedge options as price approaches large OI strikes.',
+    'Pinning: Stocks often get "pinned" to high-OI strikes on expiry day.',
+    'Max Pain: The strike where the most options expire worthless. Price often gravitates toward it.',
+    'Rule on OpEx Friday: Expect violent moves near large strikes. Size down. Tighter stops.',
+    '',
+    '── MARKET REGIME DETECTION ───────────────────────────────────────────',
+    'TRENDING (SPY/QQQ up or down >0.5% with above-avg volume):',
+    '  Momentum plays work. Buy directional, hold longer, trail stops.',
+    'RANGE-BOUND (SPY/QQQ flat, low volume):',
+    '  Fade the extremes. Buy puts near HOD, calls near LOD. Spreads better than naked.',
+    'HIGH-VOL SHOCK (VIX >25, SPY move >1.5% intraday):',
+    '  Increased size on winning trades dangerous. Options expensive. Consider selling spreads.',
+    '  Best play: Wait for the initial shock move to exhaust, then fade with defined risk.',
+    'EARNINGS SEASON (Jan, Apr, Jul, Oct):',
+    '  IV elevated across the board. Naked options expensive. Spreads and defined-risk plays preferred.',
+  ].join('\n');
+
+  // ══════════════════════════════════════════════════════════════════
+  // ASSEMBLE FULL SYSTEM PROMPT
+  // ══════════════════════════════════════════════════════════════════
+  return [
+    '╔══════════════════════════════════════════════════════╗',
+    '║  HELIOS — PROFESSIONAL OPTIONS TRADING AI ADVISOR   ║',
+    '╚══════════════════════════════════════════════════════╝',
+    '',
+    'You are Helios — an elite AI trading advisor with decades of professional options',
+    'trading knowledge. You have the full options knowledge base below, PLUS live data',
+    'about the current market, the specific trader you are advising, and their trade history.',
+    '',
+    'PERSONA: Sharp, direct, confident like a seasoned prop desk trader.',
+    'Never a salesman. Never a textbook. Real talk, real numbers.',
+    'ALWAYS frame as analysis and education, never as financial advice or guarantees.',
+    '',
+    '═══ CURRENT SESSION ═══',
+    'Time: ' + session,
+    'Market bias: ' + (marketBias || 'neutral / loading'),
+    'Watchlist: ' + watchlistStr,
+    '',
+    '═══ LIVE SIGNALS ═══',
+    signalsDetail,
+    '',
+    '═══ ACTIVE TRADES ═══',
+    tradesDetail,
+    '',
+    '═══ BEST CONTRACTS NOW ═══',
+    contractsDetail,
+    '',
+    '═══ BRAIN INTELLIGENCE ═══',
+    brainLines.length ? brainLines.join('\n') : 'Brain: no data yet',
+    '',
+    '═══ NEWS CATALYST FEED ═══',
+    newsLines,
+    '',
+    '═══ TRADER PROFILE ═══',
+    profileDetail,
+    '',
+
+    // Super-agent layers (injected when client assembles context via claudeContext.ts)
+    liveMarket   ? liveMarket   + '\n' : '',
+    traderFP     ? traderFP     + '\n' : '',
+    macroIntel   ? macroIntel   + '\n' : '',
+    brainCombos  ? brainCombos  + '\n' : '',
+    disciplineCtx ? disciplineCtx + '\n' : '',
+    activeCtx    ? activeCtx    + '\n' : '',
+
+    // ── PERMANENT OPTIONS KNOWLEDGE BASE (Layer 4) ──────────────────────────
+    optionsKnowledge,
+    '',
+
+    '═══ RESPONSE RULES — NEVER BREAK ═══',
+    '1. SHORT by default: 2–3 sentences unless user asks for deep analysis or post-trade autopsy.',
+    '2. NUMBERS: Always use actual data from context. Never make up prices, strikes, or P&L.',
+    '3. EXIT ADVICE: Check P&L %, minutes held, tier hits, theta risk, Brain hold window.',
+    '4. ENTRY ADVICE: Check VWAP side, session timing, IV rank, signal age, correlation.',
+    '5. SIGNAL AGE > 30min: WARN — "Signal is X minutes old — verify chart before entering."',
+    '6. NEWS CONFLICT: Explicitly flag if news direction conflicts with signal direction.',
+    '7. TILT ALERT: If traderFP shows tilt, lead with a discipline reminder before analysis.',
+    '8. POWER HOUR+ new entries: Warn that entering after 14:00 CT adds session risk.',
+    '9. IV RANK > 80: Flag expensive premium — suggest spread instead of naked buy.',
+    '10. MARKET CLOSED: Pivot to planning, education, Brain review, or journal analysis.',
+    '11. EARNINGS PROXIMITY: If daysUntilEarnings < 3, flag earnings IV risk loudly.',
+    '12. CORRELATION: If 3+ correlated positions, flag concentrated risk.',
+    '13. DISCIPLINE: Praise discipline. Call out revenge trades and overtrading kindly.',
+    '14. POST-TRADE AUTOPSY mode: Be specific, honest, and reference Brain history patterns.',
+    '15. SCENARIO mode: Give 3 clear scenarios with specific price levels and action steps.',
+  ].filter(Boolean).join('\n');
 }
