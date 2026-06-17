@@ -1,5 +1,6 @@
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 200;
+const MAX_PAGES = 10;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -7,12 +8,11 @@ function sleep(ms) {
 
 async function polygonFetch(url, attempt = 1) {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
 
     if (res.status === 429) {
       if (attempt < MAX_RETRIES) {
-        console.warn(`[chain.js] Polygon 429 rate limit on attempt ${attempt}, retrying in ${RETRY_DELAY_MS * attempt}ms...`);
-        await sleep(RETRY_DELAY_MS * attempt);
+        await sleep(RETRY_DELAY_MS * attempt * 2);
         return polygonFetch(url, attempt + 1);
       }
       console.error('[chain.js] Polygon 429 after all retries');
@@ -21,7 +21,6 @@ async function polygonFetch(url, attempt = 1) {
 
     if (res.status >= 500) {
       if (attempt < MAX_RETRIES) {
-        console.warn(`[chain.js] Polygon ${res.status} server error on attempt ${attempt}, retrying...`);
         await sleep(RETRY_DELAY_MS * attempt);
         return polygonFetch(url, attempt + 1);
       }
@@ -30,40 +29,32 @@ async function polygonFetch(url, attempt = 1) {
     }
 
     if (!res.ok) {
-      console.error(`[chain.js] Polygon non-retryable error: ${res.status} for ${url}`);
+      console.warn(`[chain.js] Polygon non-OK ${res.status} for ${url}`);
       return null;
     }
 
     return res;
   } catch (err) {
     if (attempt < MAX_RETRIES) {
-      console.warn(`[chain.js] Network error on attempt ${attempt}: ${err.message}, retrying...`);
       await sleep(RETRY_DELAY_MS * attempt);
       return polygonFetch(url, attempt + 1);
     }
-    console.error(`[chain.js] Network error after all retries: ${err.message}`);
+    console.error('[chain.js] Network error after all retries:', err.message);
     return null;
   }
 }
 
-async function fetchAllPages(initialUrl, polygonKey) {
+async function fetchAllPages(initialUrl, _polygonKey) {
   const results = [];
   let url = initialUrl;
   let pageCount = 0;
-  const MAX_PAGES = 10;
 
   while (url && pageCount < MAX_PAGES) {
-    const fetchUrl = url.includes('apiKey') ? url : `${url}&apiKey=${polygonKey}`;
-    const res = await polygonFetch(fetchUrl);
-    if (!res) break;
+    const r = await polygonFetch(url);
+    if (!r) break;
 
     let data;
-    try {
-      data = await res.json();
-    } catch {
-      console.error('[chain.js] JSON parse error on page', pageCount + 1);
-      break;
-    }
+    try { data = await r.json(); } catch { break; }
 
     if (Array.isArray(data.results)) {
       results.push(...data.results);
@@ -88,7 +79,7 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { symbol, datesOnly, expiration } = req.query;
+  const { symbol, datesOnly, expiration, allExpiries } = req.query;
 
   if (!symbol) {
     return res.status(400).json({ error: 'symbol parameter required' });
@@ -105,6 +96,7 @@ module.exports = async function handler(req, res) {
     });
   }
 
+  // ─── Helper: fetch spot price directly from Polygon snapshot ─────────────────
   async function fetchSpot(ticker) {
     try {
       const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}?apiKey=${polygonKey}`;
@@ -121,6 +113,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // ─── Helper: fetch all real expiry dates for a symbol ────────────────────────
   async function fetchExpiryDates(ticker) {
     const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
     const r = await polygonFetch(url);
@@ -133,7 +126,44 @@ module.exports = async function handler(req, res) {
     return Array.from(dates).sort();
   }
 
-  // ── MODE 1: Expiry dates only ─────────────────────────────────────────────────
+  // ─── Helper: detect block trade from conditions array ─────────────────────────
+  // Polygon condition "41" = "Trade Thru Exempt" / large institutional block
+  // We also flag any last_trade.size > 50 contracts as a block print
+  function isBlockTrade(contract) {
+    const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
+    if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
+    const lastSize = contract.market_data?.last_trade?.size ?? 0;
+    return lastSize >= 50;
+  }
+
+  // ─── Helper: compute volume-weighted IV for a side ───────────────────────────
+  function computeVWIV(contracts, side) {
+    let totalVol = 0;
+    let weightedIV = 0;
+    contracts.forEach(c => {
+      const iv  = side === 'call' ? c.callIV  : c.putIV;
+      const vol = side === 'call' ? c.callVolume : c.putVolume;
+      if (iv > 0 && vol > 0) {
+        weightedIV += iv * vol;
+        totalVol   += vol;
+      }
+    });
+    return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
+  }
+
+  // ─── Helper: find top OI concentration walls ────────────────────────────────
+  function findOIWalls(contracts, side) {
+    const sorted = [...contracts]
+      .filter(c => side === 'call' ? c.callOI > 0 : c.putOI > 0)
+      .sort((a, b) => (side === 'call' ? b.callOI - a.callOI : b.putOI - a.putOI))
+      .slice(0, 5);
+    return sorted.map(c => ({
+      strike: c.strike,
+      oi: side === 'call' ? c.callOI : c.putOI,
+    }));
+  }
+
+  // ─── MODE 1: Fetch available expiry dates ─────────────────────────────────────
   if (datesOnly === 'true') {
     try {
       const sortedDates = await fetchExpiryDates(sym);
@@ -144,10 +174,72 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ── MODE 2: Full options chain ────────────────────────────────────────────────
+  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
+  // Returns per-expiry GEX data across all upcoming expiries (for stacking)
+  if (allExpiries === 'true') {
+    try {
+      const allDates = await fetchExpiryDates(sym);
+      const today = new Date().toISOString().split('T')[0];
+      const upcoming = allDates.filter(d => d >= today).slice(0, 8);
+
+      if (!upcoming.length) {
+        return res.status(200).json({ symbol: sym, expiryGEX: [], source: 'polygon-empty' });
+      }
+
+      const { price: spot } = await fetchSpot(sym);
+
+      const expiryGEX = await Promise.allSettled(
+        upcoming.map(async (expDate) => {
+          try {
+            const callsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
+            const putsUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
+            const [calls, puts] = await Promise.all([
+              fetchAllPages(callsUrl, polygonKey),
+              fetchAllPages(putsUrl, polygonKey),
+            ]);
+
+            const strikeSet = new Set([
+              ...calls.map(c => c.details?.strike_price).filter(Boolean),
+              ...puts.map(p => p.details?.strike_price).filter(Boolean),
+            ]);
+
+            const strikes = Array.from(strikeSet).sort((a, b) => a - b).map(strike => {
+              const call = calls.find(c => c.details?.strike_price === strike);
+              const put  = puts.find(p => p.details?.strike_price === strike);
+              const callGamma = call?.greeks?.gamma ?? 0;
+              const putGamma  = put?.greeks?.gamma  ?? 0;
+              const callOI    = call?.open_interest ?? 0;
+              const putOI     = put?.open_interest  ?? 0;
+              const netGEX    = (callGamma * callOI - putGamma * putOI) * spot * 100;
+              return { strike, callGamma, putGamma, callOI, putOI, netGEX };
+            });
+
+            const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
+            const dominantWall = strikes.reduce((best, s) =>
+              Math.abs(s.netGEX) > Math.abs(best?.netGEX ?? 0) ? s : best, null);
+
+            return { expiry: expDate, strikes, totalNetGEX, dominantWall };
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const results = expiryGEX
+        .filter(r => r.status === 'fulfilled' && r.value !== null)
+        .map(r => r.value);
+
+      return res.status(200).json({ symbol: sym, spot, expiryGEX: results, source: 'polygon-realtime' });
+    } catch (error) {
+      console.error('Error fetching multi-expiry GEX:', error);
+      return res.status(200).json({ symbol: sym, expiryGEX: [], source: 'polygon-error' });
+    }
+  }
+
+  // ─── MODE 2: Full options chain ───────────────────────────────────────────────
   if (expiration) {
     try {
-      // Date validation — slide to nearest real date if needed
+      // ── Date validation: make sure expiration is a real Polygon date ──────────
       let resolvedExpiration = expiration;
 
       const callsCheckUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expiration}&limit=1&apiKey=${polygonKey}`;
@@ -168,7 +260,7 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Fetch all calls + puts with full pagination
+      // ── Fetch all calls and puts with pagination ──────────────────────────────
       const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
       const putsBaseUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
@@ -191,7 +283,7 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      // Spot price
+      // ── Spot price extraction ────────────────────────────────────────────────
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
@@ -215,67 +307,113 @@ module.exports = async function handler(req, res) {
         ? ((spot - spotPrevClose) / spotPrevClose) * 100
         : 0;
 
-      // Build contract map by strike
+      // ── Build contract map by strike ─────────────────────────────────────────
       const contractMap = new Map();
 
       function ensureStrike(strike) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
             strike,
-            callBid: 0, callAsk: 0, callIV: 0,  callOI: 0,  callVolume: 0,
-            callDelta: null, callTheta: null, callGamma: null, callVega: null,
+            // Bid/Ask/Last
+            callBid: 0, callAsk: 0, callIV: 0, callOI: 0, callVolume: 0,
             callLast: 0, callDayVol: 0, callPrevDayVol: 0, callVolumeRatio: null,
-            putBid: 0,  putAsk: 0,  putIV: 0,   putOI: 0,   putVolume: 0,
-            putDelta: null, putTheta: null, putGamma: null, putVega: null,
+            // Greeks (Phase 2)
+            callDelta: null, callTheta: null, callGamma: null, callVega: null,
+            // Phase 3 Greeks
+            callVanna: null, callCharm: null,
+            // Phase 3 extras
+            callBlockTrade: false, callIlliquid: false,
+            // Puts
+            putBid: 0, putAsk: 0, putIV: 0, putOI: 0, putVolume: 0,
             putLast: 0, putDayVol: 0, putPrevDayVol: 0, putVolumeRatio: null,
+            putDelta: null, putTheta: null, putGamma: null, putVega: null,
+            putVanna: null, putCharm: null,
+            putBlockTrade: false, putIlliquid: false,
+            // ATM/ITM
             atm: false, itmCall: false, itmPut: false,
           });
         }
         return contractMap.get(strike);
       }
 
+      // Process calls
       callsResults.forEach(c => {
         const strike = c.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
-        entry.callBid    = c.market_data?.bid            ?? 0;
-        entry.callAsk    = c.market_data?.ask            ?? 0;
-        entry.callLast   = c.market_data?.last_trade?.price ?? c.market_data?.last_quote?.midpoint ?? 0;
+
+        const bid  = c.market_data?.bid ?? 0;
+        const ask  = c.market_data?.ask ?? 0;
+        // Phase 3: prefer last_trade price for premium accuracy
+        const lastTradePrice = c.market_data?.last_trade?.price
+          ?? c.market_data?.last_quote?.midpoint
+          ?? 0;
+
+        entry.callBid    = bid;
+        entry.callAsk    = ask;
+        entry.callLast   = lastTradePrice;
         entry.callIV     = c.greeks?.implied_volatility != null
-          ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1)) : 0;
-        entry.callOI     = c.open_interest               ?? 0;
-        entry.callVolume = c.volume                      ?? 0;
+          ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
+          : 0;
+        entry.callOI     = c.open_interest ?? 0;
+        entry.callVolume = c.volume        ?? 0;
+        // Phase 2 Greeks
         entry.callDelta  = c.greeks?.delta  ?? null;
         entry.callTheta  = c.greeks?.theta  ?? null;
         entry.callGamma  = c.greeks?.gamma  ?? null;
         entry.callVega   = c.greeks?.vega   ?? null;
-        entry.callDayVol     = c.day?.volume         ?? 0;
-        entry.callPrevDayVol = c.prev_day?.volume    ?? 0;
+        // Phase 3 Greeks: vanna & charm
+        entry.callVanna  = c.greeks?.vanna  ?? null;
+        entry.callCharm  = c.greeks?.charm  ?? null;
+        // Volume ratio
+        entry.callDayVol     = c.day?.volume      ?? 0;
+        entry.callPrevDayVol = c.prev_day?.volume ?? 0;
         entry.callVolumeRatio = entry.callPrevDayVol > 0
-          ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2)) : null;
+          ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
+          : null;
+        // Phase 3: block trade detection
+        entry.callBlockTrade = isBlockTrade(c);
+        // Illiquid flag: spread > 50% of ask
+        entry.callIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
+      // Process puts
       putsResults.forEach(p => {
         const strike = p.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
-        entry.putBid    = p.market_data?.bid            ?? 0;
-        entry.putAsk    = p.market_data?.ask            ?? 0;
-        entry.putLast   = p.market_data?.last_trade?.price ?? p.market_data?.last_quote?.midpoint ?? 0;
+
+        const bid  = p.market_data?.bid ?? 0;
+        const ask  = p.market_data?.ask ?? 0;
+        const lastTradePrice = p.market_data?.last_trade?.price
+          ?? p.market_data?.last_quote?.midpoint
+          ?? 0;
+
+        entry.putBid    = bid;
+        entry.putAsk    = ask;
+        entry.putLast   = lastTradePrice;
         entry.putIV     = p.greeks?.implied_volatility != null
-          ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1)) : 0;
-        entry.putOI     = p.open_interest               ?? 0;
-        entry.putVolume = p.volume                      ?? 0;
+          ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
+          : 0;
+        entry.putOI     = p.open_interest ?? 0;
+        entry.putVolume = p.volume        ?? 0;
         entry.putDelta  = p.greeks?.delta  ?? null;
         entry.putTheta  = p.greeks?.theta  ?? null;
         entry.putGamma  = p.greeks?.gamma  ?? null;
         entry.putVega   = p.greeks?.vega   ?? null;
-        entry.putDayVol     = p.day?.volume         ?? 0;
-        entry.putPrevDayVol = p.prev_day?.volume    ?? 0;
+        // Phase 3 Greeks
+        entry.putVanna  = p.greeks?.vanna  ?? null;
+        entry.putCharm  = p.greeks?.charm  ?? null;
+        entry.putDayVol     = p.day?.volume      ?? 0;
+        entry.putPrevDayVol = p.prev_day?.volume ?? 0;
         entry.putVolumeRatio = entry.putPrevDayVol > 0
-          ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2)) : null;
+          ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2))
+          : null;
+        entry.putBlockTrade = isBlockTrade(p);
+        entry.putIlliquid   = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
+      // ── ATM / ITM flags using real spot ─────────────────────────────────────
       const strikeStep = spot < 10 ? 0.5
                        : spot < 50 ? 1
                        : spot < 200 ? 5
@@ -291,20 +429,34 @@ module.exports = async function handler(req, res) {
           itmPut:  spot > 0 ? c.strike > spot : false,
         }));
 
-      // ATM straddle implied move
+      // ── ATM straddle implied move ─────────────────────────────────────────────
       let impliedMove = null;
       if (spot > 0) {
         const atmEntry = contracts.find(c => c.atm);
         if (atmEntry) {
           const callMid = atmEntry.callBid > 0 && atmEntry.callAsk > 0
-            ? (atmEntry.callBid + atmEntry.callAsk) / 2 : atmEntry.callLast || 0;
+            ? (atmEntry.callBid + atmEntry.callAsk) / 2
+            : atmEntry.callLast || 0;
           const putMid = atmEntry.putBid > 0 && atmEntry.putAsk > 0
-            ? (atmEntry.putBid + atmEntry.putAsk) / 2 : atmEntry.putLast || 0;
+            ? (atmEntry.putBid + atmEntry.putAsk) / 2
+            : atmEntry.putLast || 0;
           if (callMid > 0 && putMid > 0) {
             impliedMove = parseFloat(((callMid + putMid) / spot * 100).toFixed(2));
           }
         }
       }
+
+      // ── Phase 3: Volume-Weighted IV (VWIV) ──────────────────────────────────
+      const vwivCall = computeVWIV(contracts, 'call');
+      const vwivPut  = computeVWIV(contracts, 'put');
+
+      // ── Phase 3: OI Concentration Walls ─────────────────────────────────────
+      const callOIWalls = findOIWalls(contracts, 'call');
+      const putOIWalls  = findOIWalls(contracts, 'put');
+
+      // ── Phase 3: Block trade summary ────────────────────────────────────────
+      const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
+      const blockPutCount  = contracts.filter(c => c.putBlockTrade).length;
 
       return res.status(200).json({
         symbol: sym,
@@ -314,6 +466,13 @@ module.exports = async function handler(req, res) {
         impliedMove,
         expiration: resolvedExpiration,
         contracts,
+        // Phase 3 chain-level fields
+        vwivCall,
+        vwivPut,
+        callOIWalls,
+        putOIWalls,
+        blockCallCount,
+        blockPutCount,
         source: 'polygon-realtime',
       });
 
@@ -326,8 +485,9 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // ─── No mode specified ────────────────────────────────────────────────────────
   return res.status(400).json({
-    error: 'Either datesOnly=true or expiration parameter required',
-    usage: 'GET /api/chain?symbol=TSLA&datesOnly=true  OR  GET /api/chain?symbol=TSLA&expiration=2026-06-20',
+    error: 'Either datesOnly=true, expiration, or allExpiries=true required',
+    usage: 'GET /api/chain?symbol=TSLA&datesOnly=true  OR  /api/chain?symbol=TSLA&expiration=2026-06-20  OR  /api/chain?symbol=TSLA&allExpiries=true',
   });
 };
