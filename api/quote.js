@@ -10,19 +10,22 @@ module.exports = async function handler(req, res) {
   const sym = symbol.toUpperCase().trim();
   const polygonKey = process.env.POLYGON_API_KEY;
 
-  // ── Intraday candles (last 30 × 1-min bars — real-time, was 5-min delayed) ──
+  // ── Intraday candles (last 60 × 1-min bars — real-time) ──────────────────────
   if (type === 'candles') {
     if (!polygonKey) return res.status(200).json({ symbol: sym, bars: [], error: 'No Polygon key' });
     try {
       const now = new Date();
-      const from = new Date(now.getTime() - 60 * 60 * 1000); // last 60 min
+      const from = new Date(now.getTime() - 60 * 60 * 1000);
       const candleRes = await fetch(
         `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(sym)}/range/1/minute/${from.toISOString()}/${now.toISOString()}?adjusted=true&sort=asc&limit=60&apiKey=${polygonKey}`,
-        { headers: { 'User-Agent': 'Helios/1.0' } }
+        { headers: { 'User-Agent': 'Helios/3.0' } }
       );
       if (!candleRes.ok) return res.status(200).json({ symbol: sym, bars: [], error: `Polygon ${candleRes.status}` });
       const data = await candleRes.json();
-      const bars = (data?.results ?? []).slice(-30);
+      const bars = (data?.results ?? []).map(b => ({
+        time: new Date(b.t).toISOString(),
+        open: b.o, high: b.h, low: b.l, close: b.c, volume: b.v,
+      }));
       return res.status(200).json({ symbol: sym, bars, count: bars.length, source: 'polygon-realtime', resolution: '1min' });
     } catch (e) {
       return res.status(200).json({ symbol: sym, bars: [], error: e.message || 'Candles failed' });
@@ -37,7 +40,7 @@ module.exports = async function handler(req, res) {
       const from = new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
       const aggRes = await fetch(
         `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(sym)}/range/1/day/${from.toISOString().split('T')[0]}/${to.toISOString().split('T')[0]}?adjusted=true&sort=asc&limit=30&apiKey=${polygonKey}`,
-        { headers: { 'User-Agent': 'Helios/1.0' } }
+        { headers: { 'User-Agent': 'Helios/3.0' } }
       );
       if (!aggRes.ok) return res.status(200).json({ symbol: sym, avgDailyVolume: 0, error: `Polygon ${aggRes.status}` });
       const data = await aggRes.json();
@@ -57,7 +60,7 @@ module.exports = async function handler(req, res) {
     try {
       const snapshotRes = await fetch(
         `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(sym)}?apiKey=${polygonKey}`,
-        { headers: { 'User-Agent': 'Helios/1.0' } }
+        { headers: { 'User-Agent': 'Helios/3.0' } }
       );
       const snapshotData = snapshotRes.ok ? await snapshotRes.json() : null;
       const spot = snapshotData?.ticker?.lastTrade?.p
@@ -67,110 +70,202 @@ module.exports = async function handler(req, res) {
 
       if (!spot) return res.status(200).json({ symbol: sym, error: 'No spot price' });
 
-      // Get nearest expiry
-      const expiryRes = await fetch(
-        `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${sym}&limit=50&apiKey=${polygonKey}`,
-        { headers: { 'User-Agent': 'Helios/1.0' } }
-      );
-      if (!expiryRes.ok) return res.status(200).json({ symbol: sym, error: `Polygon expiry ${expiryRes.status}` });
-      const expiryData = await expiryRes.json();
-      const dates = [...new Set((expiryData.results || []).map(c => c.expiration_date))].sort();
       const today = new Date().toISOString().split('T')[0];
-      const nearestExpiry = dates.find(d => d >= today) || dates[0];
-      if (!nearestExpiry) return res.status(200).json({ symbol: sym, error: 'No expiry found' });
-
-      // Fetch ATM contracts for that expiry
-      const chainRes = await fetch(
-        `https://api.polygon.io/v3/snapshot/options/${sym}?expiration_date=${nearestExpiry}&limit=250&apiKey=${polygonKey}`,
-        { headers: { 'User-Agent': 'Helios/1.0' } }
+      const optRes = await fetch(
+        `https://api.polygon.io/v3/snapshot/options/${encodeURIComponent(sym)}?expiration_date.gte=${today}&limit=50&apiKey=${polygonKey}`,
+        { headers: { 'User-Agent': 'Helios/3.0' } }
       );
-      if (!chainRes.ok) return res.status(200).json({ symbol: sym, error: `Chain fetch ${chainRes.status}` });
-      const chainData = await chainRes.json();
-      const allContracts = chainData?.results ?? [];
+      if (!optRes.ok) return res.status(200).json({ symbol: sym, spot, error: `Options snapshot ${optRes.status}` });
+      const optData = await optRes.json();
+      const results = optData?.results ?? [];
 
-      // Find ATM contracts (closest strike to spot)
-      const strikes = [...new Set(allContracts.map(c => c.details?.strike_price).filter(Boolean))].sort((a, b) => a - b);
-      const atmStrike = strikes.reduce((prev, curr) => Math.abs(curr - spot) < Math.abs(prev - spot) ? curr : prev, strikes[0]);
+      let atmCall = null, atmPut = null;
+      let minCallDist = Infinity, minPutDist = Infinity;
+      let totalCallOI = 0, totalPutOI = 0;
+      let totalCallVol = 0, totalPutVol = 0;
 
-      const atmCall = allContracts.find(c => c.details?.strike_price === atmStrike && c.details?.contract_type === 'call');
-      const atmPut  = allContracts.find(c => c.details?.strike_price === atmStrike && c.details?.contract_type === 'put');
+      for (const r of results) {
+        const strike = r.details?.strike_price ?? 0;
+        const type_ = r.details?.contract_type ?? '';
+        const oi = r.open_interest ?? 0;
+        const vol = r.day?.volume ?? 0;
+        if (type_ === 'call') { totalCallOI += oi; totalCallVol += vol; }
+        if (type_ === 'put')  { totalPutOI  += oi; totalPutVol  += vol; }
+        const dist = Math.abs(strike - spot);
+        if (type_ === 'call' && dist < minCallDist) { minCallDist = dist; atmCall = r; }
+        if (type_ === 'put'  && dist < minPutDist)  { minPutDist = dist; atmPut  = r; }
+      }
 
-      const callIV    = atmCall?.greeks?.implied_volatility != null ? parseFloat((atmCall.greeks.implied_volatility * 100).toFixed(1)) : null;
-      const putIV     = atmPut?.greeks?.implied_volatility  != null ? parseFloat((atmPut.greeks.implied_volatility  * 100).toFixed(1)) : null;
+      const callIV    = atmCall?.greeks?.implied_volatility ? atmCall.greeks.implied_volatility * 100 : null;
       const callDelta = atmCall?.greeks?.delta ?? null;
-      const putDelta  = atmPut?.greeks?.delta  ?? null;
       const callGamma = atmCall?.greeks?.gamma ?? null;
       const callTheta = atmCall?.greeks?.theta ?? null;
-      const callVega  = atmCall?.greeks?.vega  ?? null;
-      const putGamma  = atmPut?.greeks?.gamma  ?? null;
-      const putTheta  = atmPut?.greeks?.theta  ?? null;
-      const putVega   = atmPut?.greeks?.vega   ?? null;
+      const putIV     = atmPut?.greeks?.implied_volatility  ? atmPut.greeks.implied_volatility * 100  : null;
+      const putDelta  = atmPut?.greeks?.delta  ?? null;
+      const pcRatio   = totalCallOI > 0 ? totalPutOI / totalCallOI : null;
 
-      // P/C ratio from full chain
-      const totalCallVol = allContracts.filter(c => c.details?.contract_type === 'call').reduce((s, c) => s + (c.volume || 0), 0);
-      const totalPutVol  = allContracts.filter(c => c.details?.contract_type === 'put').reduce((s, c) => s + (c.volume || 0), 0);
-      const putCallRatio = totalCallVol > 0 ? parseFloat((totalPutVol / totalCallVol).toFixed(2)) : null;
-
-      // Straddle implied move
-      const callMid = atmCall ? ((atmCall.market_data?.bid || 0) + (atmCall.market_data?.ask || 0)) / 2 : 0;
-      const putMid  = atmPut  ? ((atmPut.market_data?.bid  || 0) + (atmPut.market_data?.ask  || 0)) / 2 : 0;
-      const impliedMove = callMid > 0 && putMid > 0 && spot > 0
-        ? parseFloat(((callMid + putMid) / spot * 100).toFixed(2))
+      const callMid = atmCall ? ((atmCall.day?.ask ?? 0) + (atmCall.day?.bid ?? 0)) / 2 : 0;
+      const putMid  = atmPut  ? ((atmPut.day?.ask  ?? 0) + (atmPut.day?.bid  ?? 0)) / 2  : 0;
+      const impliedMove = spot > 0 && (callMid + putMid) > 0
+        ? ((callMid + putMid) / spot * 100).toFixed(2)
         : null;
 
       return res.status(200).json({
-        symbol: sym,
-        spot,
-        expiry: nearestExpiry,
-        atmStrike,
-        callIV, putIV,
-        callDelta, putDelta,
-        callGamma, putGamma,
-        callTheta, putTheta,
-        callVega, putVega,
-        putCallRatio,
-        impliedMove,
+        symbol: sym, spot, callIV, callDelta, callGamma, callTheta,
+        putIV, putDelta, pcRatio, totalCallOI, totalPutOI,
+        totalCallVol, totalPutVol, impliedMove,
         source: 'polygon-realtime',
       });
-    } catch (err) {
-      return res.status(200).json({ symbol: sym, error: err.message || 'Options fetch failed' });
+    } catch (e) {
+      return res.status(200).json({ symbol: sym, error: e.message || 'Options Greeks failed' });
     }
   }
 
-  // ── Real-time quote (Polygon primary) ────────────────────────────────────────
-  if (!polygonKey) return fetchYahooFallback(sym, res);
+  // ── Phase 3: Historical Volatility (5yr daily bars → HV computation) ─────────
+  // Returns realized volatility at 10d, 20d, 60d, 252d windows
+  // Also returns IV/HV ratio and whether options are cheap or expensive
+  if (type === 'hv') {
+    if (!polygonKey) return res.status(200).json({ symbol: sym, error: 'No Polygon key' });
+    try {
+      // Fetch 5 years of daily bars (1260 trading days)
+      const to   = new Date();
+      const from = new Date(to.getTime() - 5 * 365 * 24 * 60 * 60 * 1000);
+      const hvRes = await fetch(
+        `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(sym)}/range/1/day/${from.toISOString().split('T')[0]}/${to.toISOString().split('T')[0]}?adjusted=true&sort=asc&limit=1500&apiKey=${polygonKey}`,
+        { headers: { 'User-Agent': 'Helios/3.0' } }
+      );
+
+      if (!hvRes.ok) {
+        return res.status(200).json({ symbol: sym, error: `Polygon HV ${hvRes.status}` });
+      }
+
+      const hvData = await hvRes.json();
+      const bars = hvData?.results ?? [];
+
+      if (bars.length < 22) {
+        return res.status(200).json({ symbol: sym, error: 'Insufficient history for HV', bars: bars.length });
+      }
+
+      // Compute log returns (daily)
+      // HV formula: annualized std dev of log returns × √252
+      const closes = bars.map(b => b.c);
+      const logReturns = [];
+      for (let i = 1; i < closes.length; i++) {
+        if (closes[i] > 0 && closes[i - 1] > 0) {
+          logReturns.push(Math.log(closes[i] / closes[i - 1]));
+        }
+      }
+
+      function computeHV(returns, window) {
+        if (returns.length < window) return null;
+        const slice = returns.slice(-window);
+        const mean = slice.reduce((a, b) => a + b, 0) / window;
+        const variance = slice.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / (window - 1);
+        return parseFloat((Math.sqrt(variance * 252) * 100).toFixed(2));
+      }
+
+      const hv10  = computeHV(logReturns, 10);
+      const hv20  = computeHV(logReturns, 20);
+      const hv60  = computeHV(logReturns, 60);
+      const hv252 = computeHV(logReturns, 252);
+
+      // 52-week high/low from recent closes
+      const last252Closes = closes.slice(-252);
+      const high52w = Math.max(...last252Closes);
+      const low52w  = Math.min(...last252Closes);
+      const currentClose = closes[closes.length - 1];
+
+      // IV/HV ratio — caller passes iv as query param if available
+      const ivParam = req.query.iv ? parseFloat(req.query.iv) : null;
+      const ivHvRatio = ivParam && hv20 ? parseFloat((ivParam / hv20).toFixed(2)) : null;
+      // Options are "expensive" when IV > 1.5x HV20
+      const expensiveOptions = ivHvRatio != null ? ivHvRatio > 1.5 : null;
+      // Options are "cheap" when IV < 0.8x HV20 (unusual)
+      const cheapOptions = ivHvRatio != null ? ivHvRatio < 0.8 : null;
+
+      // Price percentile (where today's price sits in 5yr range)
+      const allCloses = closes;
+      const below = allCloses.filter(c => c <= currentClose).length;
+      const pricePercentile = Math.round((below / allCloses.length) * 100);
+
+      // Last 252 trading days for sparkline / chart display
+      const priceHistory = bars.slice(-252).map(b => ({
+        date: new Date(b.t).toISOString().split('T')[0],
+        close: b.c,
+        volume: b.v,
+      }));
+
+      return res.status(200).json({
+        symbol: sym,
+        hv10,
+        hv20,
+        hv60,
+        hv252,
+        ivHvRatio,
+        expensiveOptions,
+        cheapOptions,
+        high52w,
+        low52w,
+        currentClose,
+        pricePercentile,
+        totalBars: bars.length,
+        priceHistory,
+        source: 'polygon-5yr',
+      });
+    } catch (e) {
+      return res.status(200).json({ symbol: sym, error: e.message || 'HV computation failed' });
+    }
+  }
+
+  // ── Main quote — REAL-TIME via Polygon snapshot (PRIMARY) ────────────────────
+  if (!polygonKey) {
+    return fetchYahooFallback(sym, res);
+  }
 
   try {
-    const polygonRes = await fetch(
-      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(sym)}?apiKey=${polygonKey}`,
-      { headers: { 'User-Agent': 'Helios/1.0' } }
-    );
-    if (!polygonRes.ok) throw new Error(`Polygon ${polygonRes.status}`);
-    const data = await polygonRes.json();
-    const ticker = data?.ticker;
-    if (!ticker) throw new Error('No ticker in Polygon response');
+    const isIndex = sym.startsWith('^') || sym === 'VIX' || sym === 'SPX';
+    const polygonSym = isIndex
+      ? sym.replace('^', 'I:').replace('VIX', 'I:VIX').replace('SPX', 'I:SPX')
+      : sym;
 
-    const dayData    = ticker.day       ?? {};
-    const prevData   = ticker.prevDay   ?? {};
-    const lastTrade  = ticker.lastTrade ?? {};
-    const lastQuote  = ticker.lastQuote ?? {};
+    const snapshotUrl = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(polygonSym)}?apiKey=${polygonKey}`;
+    const snapshotRes = await fetch(snapshotUrl, {
+      headers: { 'User-Agent': 'Helios/3.0' },
+    });
 
-    const price      = lastTrade.p || dayData.c || prevData.c || 0;
-    const prevClose  = prevData.c  || 0;
-    const change     = price - prevClose;
-    const changePct  = prevClose !== 0 ? (change / prevClose) * 100 : 0;
-    const high       = dayData.h  || price;
-    const low        = dayData.l  || price;
-    const open       = dayData.o  || prevClose;
-    const volume     = dayData.v  || 0;
-    const vwap       = dayData.vw || null;
+    if (!snapshotRes.ok) {
+      return fetchYahooFallback(sym, res);
+    }
 
-    const lastTradeSize  = lastTrade.s ?? null;
-    const lastTradeTime  = lastTrade.t ?? null;
+    const json = await snapshotRes.json();
+    const ticker = json?.ticker;
 
-    // Bid/ask spread — for real-time liquidity check
-    const bid  = lastQuote.p || null;
-    const ask  = lastQuote.P || null;
+    if (!ticker) {
+      return fetchYahooFallback(sym, res);
+    }
+
+    const price = ticker.lastTrade?.p
+      || ticker.lastQuote?.P
+      || ticker.day?.c
+      || ticker.prevDay?.c
+      || 0;
+
+    const prevClose = ticker.prevDay?.c || ticker.day?.o || price;
+    const change = price - prevClose;
+    const changePct = prevClose !== 0 ? (change / prevClose) * 100 : 0;
+
+    const dayData = ticker.day ?? {};
+    const high = dayData.h || price;
+    const low  = dayData.l || price;
+    const open = dayData.o || prevClose;
+    const volume = dayData.v || 0;
+
+    const vwap = dayData.vw || null;
+    const lastTradeSize = ticker.lastTrade?.s || null;
+    const lastTradeTime = ticker.lastTrade?.t || null;
+
+    const bid  = ticker.lastQuote?.p || null;
+    const ask  = ticker.lastQuote?.P || null;
     const bidAskSpread = bid && ask ? ((ask - bid) / ask * 100).toFixed(3) : null;
 
     return res.status(200).json({
@@ -205,7 +300,7 @@ async function fetchYahooFallback(sym, res) {
   try {
     const yahooRes = await fetch(
       `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1m&range=1d`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/1.0)', Accept: 'application/json' } }
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)', Accept: 'application/json' } }
     );
     if (!yahooRes.ok) throw new Error(`Yahoo status ${yahooRes.status}`);
     const json = await yahooRes.json();
