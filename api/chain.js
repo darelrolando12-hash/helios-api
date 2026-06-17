@@ -22,7 +22,6 @@ module.exports = async function handler(req, res) {
   }
 
   // ─── Helper: fetch spot price directly from Polygon snapshot ─────────────────
-  // Used as fallback when underlying_asset is missing from options results
   async function fetchSpot(ticker) {
     try {
       const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}?apiKey=${polygonKey}`;
@@ -30,7 +29,7 @@ module.exports = async function handler(req, res) {
       if (!r.ok) return { price: 0, prevClose: 0, vwap: 0 };
       const data = await r.json();
       const t = data?.ticker;
-      const price    = t?.lastTrade?.p || t?.day?.c || t?.prevDay?.c || 0;
+      const price     = t?.lastTrade?.p || t?.day?.c || t?.prevDay?.c || 0;
       const prevClose = t?.prevDay?.c || 0;
       const vwap      = t?.day?.vw || 0;
       return { price, prevClose, vwap };
@@ -86,8 +85,6 @@ module.exports = async function handler(req, res) {
       const [callsData, putsData] = await Promise.all([callsRes.json(), putsRes.json()]);
 
       // ── Spot price extraction ────────────────────────────────────────────────
-      // Polygon's underlying_asset is present on snapshot results but may be missing
-      // if the options results array is empty. Always fall back to direct snapshot.
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
@@ -99,7 +96,6 @@ module.exports = async function handler(req, res) {
       if (ua && ua.price > 0) {
         spot = ua.price;
         spotPrevClose = ua.day?.prev_close ?? ua.day?.c ?? 0;
-        // VWAP — real-time from Polygon (critical for signal accuracy)
         spotVwap = ua.day?.vw ?? 0;
       }
 
@@ -122,17 +118,19 @@ module.exports = async function handler(req, res) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
             strike,
-            callBid: 0, callAsk: 0, callIV: 0,  callOI: 0,  callVolume: 0,
-            callDelta: null, callTheta: null,
-            putBid: 0,  putAsk: 0,  putIV: 0,   putOI: 0,   putVolume: 0,
-            putDelta: null, putTheta: null,
+            callBid: 0, callAsk: 0, callLast: 0, callIV: 0, callOI: 0, callVolume: 0,
+            callDelta: null, callTheta: null, callGamma: null, callVega: null,
+            callDayVol: 0, callPrevDayVol: 0, callVolumeRatio: null,
+            putBid: 0,  putAsk: 0,  putLast: 0,  putIV: 0,  putOI: 0,  putVolume: 0,
+            putDelta: null, putTheta: null, putGamma: null, putVega: null,
+            putDayVol: 0, putPrevDayVol: 0, putVolumeRatio: null,
             atm: false, itmCall: false, itmPut: false,
           });
         }
         return contractMap.get(strike);
       }
 
-      // Process calls — extract ALL Greeks now that we're on Options Advanced real-time
+      // Process calls — full Greeks suite
       if (Array.isArray(callsData.results)) {
         callsData.results.forEach(c => {
           const strike = c.details?.strike_price;
@@ -141,27 +139,21 @@ module.exports = async function handler(req, res) {
 
           entry.callBid    = c.market_data?.bid            ?? 0;
           entry.callAsk    = c.market_data?.ask            ?? 0;
-          // Last trade price — real-time (no delay on Options Advanced)
           entry.callLast   = c.market_data?.last_trade?.price ?? c.market_data?.last_quote?.midpoint ?? 0;
-          // IV: Polygon returns decimal (0.42 = 42%) — multiply ×100 for display
           entry.callIV     = c.greeks?.implied_volatility != null
             ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
             : 0;
           entry.callOI     = c.open_interest               ?? 0;
           entry.callVolume = c.volume                      ?? 0;
-          // Full Greeks suite — delta, gamma, theta, vega
-          // gamma: rate of delta change per $1 move — high gamma on FOMC = explosive
-          // vega:  $ value change per 1% IV change — high vega = IV crush risk
           entry.callDelta  = c.greeks?.delta  ?? null;
           entry.callTheta  = c.greeks?.theta  ?? null;
           entry.callGamma  = c.greeks?.gamma  ?? null;
           entry.callVega   = c.greeks?.vega   ?? null;
-          // Day stats for volume trend analysis
           entry.callDayVol      = c.day?.volume         ?? 0;
           entry.callPrevDayVol  = c.prev_day?.volume    ?? 0;
           entry.callVolumeRatio = entry.callPrevDayVol > 0
             ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
-            : null; // >1 = more volume than yesterday = unusual activity
+            : null;
         });
       }
 
@@ -193,7 +185,6 @@ module.exports = async function handler(req, res) {
       }
 
       // ── ATM / ITM flags using real spot ─────────────────────────────────────
-      // Strike step by price tier — used to determine ATM band
       const strikeStep = spot < 10 ? 0.5
                        : spot < 50 ? 1
                        : spot < 200 ? 5
@@ -204,15 +195,14 @@ module.exports = async function handler(req, res) {
         .sort((a, b) => a.strike - b.strike)
         .map(c => ({
           ...c,
-          // ATM = within 60% of one strike step from spot (or ±$1 minimum)
           atm:     spot > 0 && Math.abs(c.strike - spot) < Math.max(strikeStep * 0.6, 1),
           itmCall: spot > 0 ? c.strike < spot : false,
           itmPut:  spot > 0 ? c.strike > spot : false,
         }));
 
       // ── ATM straddle implied move ─────────────────────────────────────────────
-      // ATM call + ATM put mid = straddle price → expected ± move as % of spot
-      // Especially critical for FOMC day to understand market's expected range
+      // (callMid + putMid) / spot × 100 = expected ±% move
+      // Critical for FOMC banner to show how wide to set straddle strikes
       let impliedMove = null;
       if (spot > 0) {
         const atmEntry = contracts.find(c => c.atm);
@@ -232,9 +222,9 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         symbol: sym,
         spot,
-        spotVwap,           // real-time VWAP for VWAP-cross signal detection
+        spotVwap,
         spotChangePct,
-        impliedMove,        // straddle-implied ±% move — critical for FOMC/earnings
+        impliedMove,
         expiration,
         contracts,
         source: 'polygon-realtime',
