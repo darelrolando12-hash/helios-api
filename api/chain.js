@@ -1,3 +1,87 @@
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 200;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function polygonFetch(url, attempt = 1) {
+  try {
+    const res = await fetch(url);
+
+    if (res.status === 429) {
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[chain.js] Polygon 429 rate limit on attempt ${attempt}, retrying in ${RETRY_DELAY_MS * attempt}ms...`);
+        await sleep(RETRY_DELAY_MS * attempt);
+        return polygonFetch(url, attempt + 1);
+      }
+      console.error('[chain.js] Polygon 429 after all retries');
+      return null;
+    }
+
+    if (res.status >= 500) {
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[chain.js] Polygon ${res.status} server error on attempt ${attempt}, retrying...`);
+        await sleep(RETRY_DELAY_MS * attempt);
+        return polygonFetch(url, attempt + 1);
+      }
+      console.error(`[chain.js] Polygon ${res.status} after all retries`);
+      return null;
+    }
+
+    if (!res.ok) {
+      console.error(`[chain.js] Polygon non-retryable error: ${res.status} for ${url}`);
+      return null;
+    }
+
+    return res;
+  } catch (err) {
+    if (attempt < MAX_RETRIES) {
+      console.warn(`[chain.js] Network error on attempt ${attempt}: ${err.message}, retrying...`);
+      await sleep(RETRY_DELAY_MS * attempt);
+      return polygonFetch(url, attempt + 1);
+    }
+    console.error(`[chain.js] Network error after all retries: ${err.message}`);
+    return null;
+  }
+}
+
+async function fetchAllPages(initialUrl, polygonKey) {
+  const results = [];
+  let url = initialUrl;
+  let pageCount = 0;
+  const MAX_PAGES = 10;
+
+  while (url && pageCount < MAX_PAGES) {
+    const fetchUrl = url.includes('apiKey') ? url : `${url}&apiKey=${polygonKey}`;
+    const res = await polygonFetch(fetchUrl);
+    if (!res) break;
+
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      console.error('[chain.js] JSON parse error on page', pageCount + 1);
+      break;
+    }
+
+    if (Array.isArray(data.results)) {
+      results.push(...data.results);
+    }
+
+    url = data.next_url ?? null;
+    pageCount++;
+
+    if (url) await sleep(50);
+  }
+
+  if (pageCount >= MAX_PAGES) {
+    console.warn(`[chain.js] Hit MAX_PAGES cap (${MAX_PAGES}) — some contracts may be missing`);
+  }
+
+  return results;
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -21,12 +105,11 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // ─── Helper: fetch spot price directly from Polygon snapshot ─────────────────
   async function fetchSpot(ticker) {
     try {
       const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}?apiKey=${polygonKey}`;
-      const r = await fetch(url);
-      if (!r.ok) return { price: 0, prevClose: 0, vwap: 0 };
+      const r = await polygonFetch(url);
+      if (!r) return { price: 0, prevClose: 0, vwap: 0 };
       const data = await r.json();
       const t = data?.ticker;
       const price     = t?.lastTrade?.p || t?.day?.c || t?.prevDay?.c || 0;
@@ -38,60 +121,82 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── MODE 1: Fetch available expiry dates ─────────────────────────────────────
+  async function fetchExpiryDates(ticker) {
+    const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
+    const r = await polygonFetch(url);
+    if (!r) return [];
+    let data;
+    try { data = await r.json(); } catch { return []; }
+    if (!Array.isArray(data.results)) return [];
+    const dates = new Set();
+    data.results.forEach(c => { if (c.expiration_date) dates.add(c.expiration_date); });
+    return Array.from(dates).sort();
+  }
+
+  // ── MODE 1: Expiry dates only ─────────────────────────────────────────────────
   if (datesOnly === 'true') {
     try {
-      const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${sym}&limit=1000&apiKey=${polygonKey}`;
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        console.error(`Polygon contracts API failed: ${response.status}`);
-        return res.status(200).json({ expiryDates: [] });
-      }
-
-      const data = await response.json();
-
-      if (!data.results || !Array.isArray(data.results)) {
-        return res.status(200).json({ expiryDates: [] });
-      }
-
-      const dates = new Set();
-      data.results.forEach(contract => {
-        if (contract.expiration_date) dates.add(contract.expiration_date);
-      });
-
-      const sortedDates = Array.from(dates).sort();
+      const sortedDates = await fetchExpiryDates(sym);
       return res.status(200).json({ expiryDates: sortedDates, count: sortedDates.length });
-
     } catch (error) {
       console.error('Error fetching expiry dates:', error);
       return res.status(200).json({ expiryDates: [] });
     }
   }
 
-  // ─── MODE 2: Full options chain ───────────────────────────────────────────────
+  // ── MODE 2: Full options chain ────────────────────────────────────────────────
   if (expiration) {
     try {
-      const callsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expiration}&limit=250&apiKey=${polygonKey}`;
-      const putsUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${expiration}&limit=250&apiKey=${polygonKey}`;
+      // Date validation — slide to nearest real date if needed
+      let resolvedExpiration = expiration;
 
-      const [callsRes, putsRes] = await Promise.all([fetch(callsUrl), fetch(putsUrl)]);
+      const callsCheckUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expiration}&limit=1&apiKey=${polygonKey}`;
+      const checkRes = await polygonFetch(callsCheckUrl);
+      const checkData = checkRes ? await checkRes.json() : null;
+      const hasContractsOnDate = Array.isArray(checkData?.results) && checkData.results.length > 0;
 
-      if (!callsRes.ok || !putsRes.ok) {
-        console.error(`Polygon options snapshot failed: calls=${callsRes.status}, puts=${putsRes.status}`);
-        return res.status(200).json({ contracts: [], symbol: sym, spot: 0, spotChangePct: 0, expiration });
+      if (!hasContractsOnDate) {
+        console.warn(`[chain.js] No contracts found for ${sym} on ${expiration} — searching for nearest real date`);
+        const allDates = await fetchExpiryDates(sym);
+        if (allDates.length > 0) {
+          const target = expiration;
+          const nearest = allDates.find(d => d >= target) ?? allDates[0];
+          if (nearest !== expiration) {
+            console.log(`[chain.js] Sliding expiration from ${expiration} → ${nearest} for ${sym}`);
+            resolvedExpiration = nearest;
+          }
+        }
       }
 
-      const [callsData, putsData] = await Promise.all([callsRes.json(), putsRes.json()]);
+      // Fetch all calls + puts with full pagination
+      const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
+      const putsBaseUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
-      // ── Spot price extraction ────────────────────────────────────────────────
+      const [callsResults, putsResults] = await Promise.all([
+        fetchAllPages(callsBaseUrl, polygonKey),
+        fetchAllPages(putsBaseUrl, polygonKey),
+      ]);
+
+      console.log(`[chain.js] ${sym} ${resolvedExpiration}: ${callsResults.length} calls, ${putsResults.length} puts fetched`);
+
+      if (callsResults.length === 0 && putsResults.length === 0) {
+        console.error(`[chain.js] Polygon returned zero contracts for ${sym} ${resolvedExpiration} after all retries`);
+        return res.status(200).json({
+          contracts: [],
+          symbol: sym,
+          spot: 0,
+          spotChangePct: 0,
+          expiration: resolvedExpiration,
+          source: 'polygon-empty',
+        });
+      }
+
+      // Spot price
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
 
-      const ua = callsData.results?.[0]?.underlying_asset
-               ?? putsData.results?.[0]?.underlying_asset
-               ?? null;
+      const ua = callsResults[0]?.underlying_asset ?? putsResults[0]?.underlying_asset ?? null;
 
       if (ua && ua.price > 0) {
         spot = ua.price;
@@ -99,7 +204,6 @@ module.exports = async function handler(req, res) {
         spotVwap = ua.day?.vw ?? 0;
       }
 
-      // Fallback: if underlying_asset didn't give us a price, hit the stock snapshot
       if (spot <= 0) {
         const fallback = await fetchSpot(sym);
         spot = fallback.price;
@@ -111,80 +215,67 @@ module.exports = async function handler(req, res) {
         ? ((spot - spotPrevClose) / spotPrevClose) * 100
         : 0;
 
-      // ── Build contract map by strike ─────────────────────────────────────────
+      // Build contract map by strike
       const contractMap = new Map();
 
       function ensureStrike(strike) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
             strike,
-            callBid: 0, callAsk: 0, callLast: 0, callIV: 0, callOI: 0, callVolume: 0,
+            callBid: 0, callAsk: 0, callIV: 0,  callOI: 0,  callVolume: 0,
             callDelta: null, callTheta: null, callGamma: null, callVega: null,
-            callDayVol: 0, callPrevDayVol: 0, callVolumeRatio: null,
-            putBid: 0,  putAsk: 0,  putLast: 0,  putIV: 0,  putOI: 0,  putVolume: 0,
+            callLast: 0, callDayVol: 0, callPrevDayVol: 0, callVolumeRatio: null,
+            putBid: 0,  putAsk: 0,  putIV: 0,   putOI: 0,   putVolume: 0,
             putDelta: null, putTheta: null, putGamma: null, putVega: null,
-            putDayVol: 0, putPrevDayVol: 0, putVolumeRatio: null,
+            putLast: 0, putDayVol: 0, putPrevDayVol: 0, putVolumeRatio: null,
             atm: false, itmCall: false, itmPut: false,
           });
         }
         return contractMap.get(strike);
       }
 
-      // Process calls — full Greeks suite
-      if (Array.isArray(callsData.results)) {
-        callsData.results.forEach(c => {
-          const strike = c.details?.strike_price;
-          if (!strike) return;
-          const entry = ensureStrike(strike);
+      callsResults.forEach(c => {
+        const strike = c.details?.strike_price;
+        if (!strike) return;
+        const entry = ensureStrike(strike);
+        entry.callBid    = c.market_data?.bid            ?? 0;
+        entry.callAsk    = c.market_data?.ask            ?? 0;
+        entry.callLast   = c.market_data?.last_trade?.price ?? c.market_data?.last_quote?.midpoint ?? 0;
+        entry.callIV     = c.greeks?.implied_volatility != null
+          ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1)) : 0;
+        entry.callOI     = c.open_interest               ?? 0;
+        entry.callVolume = c.volume                      ?? 0;
+        entry.callDelta  = c.greeks?.delta  ?? null;
+        entry.callTheta  = c.greeks?.theta  ?? null;
+        entry.callGamma  = c.greeks?.gamma  ?? null;
+        entry.callVega   = c.greeks?.vega   ?? null;
+        entry.callDayVol     = c.day?.volume         ?? 0;
+        entry.callPrevDayVol = c.prev_day?.volume    ?? 0;
+        entry.callVolumeRatio = entry.callPrevDayVol > 0
+          ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2)) : null;
+      });
 
-          entry.callBid    = c.market_data?.bid            ?? 0;
-          entry.callAsk    = c.market_data?.ask            ?? 0;
-          entry.callLast   = c.market_data?.last_trade?.price ?? c.market_data?.last_quote?.midpoint ?? 0;
-          entry.callIV     = c.greeks?.implied_volatility != null
-            ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
-            : 0;
-          entry.callOI     = c.open_interest               ?? 0;
-          entry.callVolume = c.volume                      ?? 0;
-          entry.callDelta  = c.greeks?.delta  ?? null;
-          entry.callTheta  = c.greeks?.theta  ?? null;
-          entry.callGamma  = c.greeks?.gamma  ?? null;
-          entry.callVega   = c.greeks?.vega   ?? null;
-          entry.callDayVol      = c.day?.volume         ?? 0;
-          entry.callPrevDayVol  = c.prev_day?.volume    ?? 0;
-          entry.callVolumeRatio = entry.callPrevDayVol > 0
-            ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
-            : null;
-        });
-      }
+      putsResults.forEach(p => {
+        const strike = p.details?.strike_price;
+        if (!strike) return;
+        const entry = ensureStrike(strike);
+        entry.putBid    = p.market_data?.bid            ?? 0;
+        entry.putAsk    = p.market_data?.ask            ?? 0;
+        entry.putLast   = p.market_data?.last_trade?.price ?? p.market_data?.last_quote?.midpoint ?? 0;
+        entry.putIV     = p.greeks?.implied_volatility != null
+          ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1)) : 0;
+        entry.putOI     = p.open_interest               ?? 0;
+        entry.putVolume = p.volume                      ?? 0;
+        entry.putDelta  = p.greeks?.delta  ?? null;
+        entry.putTheta  = p.greeks?.theta  ?? null;
+        entry.putGamma  = p.greeks?.gamma  ?? null;
+        entry.putVega   = p.greeks?.vega   ?? null;
+        entry.putDayVol     = p.day?.volume         ?? 0;
+        entry.putPrevDayVol = p.prev_day?.volume    ?? 0;
+        entry.putVolumeRatio = entry.putPrevDayVol > 0
+          ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2)) : null;
+      });
 
-      // Process puts — same full Greeks extraction
-      if (Array.isArray(putsData.results)) {
-        putsData.results.forEach(p => {
-          const strike = p.details?.strike_price;
-          if (!strike) return;
-          const entry = ensureStrike(strike);
-
-          entry.putBid    = p.market_data?.bid             ?? 0;
-          entry.putAsk    = p.market_data?.ask             ?? 0;
-          entry.putLast   = p.market_data?.last_trade?.price ?? p.market_data?.last_quote?.midpoint ?? 0;
-          entry.putIV     = p.greeks?.implied_volatility != null
-            ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
-            : 0;
-          entry.putOI     = p.open_interest                ?? 0;
-          entry.putVolume = p.volume                       ?? 0;
-          entry.putDelta  = p.greeks?.delta  ?? null;
-          entry.putTheta  = p.greeks?.theta  ?? null;
-          entry.putGamma  = p.greeks?.gamma  ?? null;
-          entry.putVega   = p.greeks?.vega   ?? null;
-          entry.putDayVol     = p.day?.volume         ?? 0;
-          entry.putPrevDayVol = p.prev_day?.volume    ?? 0;
-          entry.putVolumeRatio = entry.putPrevDayVol > 0
-            ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2))
-            : null;
-        });
-      }
-
-      // ── ATM / ITM flags using real spot ─────────────────────────────────────
       const strikeStep = spot < 10 ? 0.5
                        : spot < 50 ? 1
                        : spot < 200 ? 5
@@ -200,19 +291,15 @@ module.exports = async function handler(req, res) {
           itmPut:  spot > 0 ? c.strike > spot : false,
         }));
 
-      // ── ATM straddle implied move ─────────────────────────────────────────────
-      // (callMid + putMid) / spot × 100 = expected ±% move
-      // Critical for FOMC banner to show how wide to set straddle strikes
+      // ATM straddle implied move
       let impliedMove = null;
       if (spot > 0) {
         const atmEntry = contracts.find(c => c.atm);
         if (atmEntry) {
           const callMid = atmEntry.callBid > 0 && atmEntry.callAsk > 0
-            ? (atmEntry.callBid + atmEntry.callAsk) / 2
-            : atmEntry.callLast || 0;
+            ? (atmEntry.callBid + atmEntry.callAsk) / 2 : atmEntry.callLast || 0;
           const putMid = atmEntry.putBid > 0 && atmEntry.putAsk > 0
-            ? (atmEntry.putBid + atmEntry.putAsk) / 2
-            : atmEntry.putLast || 0;
+            ? (atmEntry.putBid + atmEntry.putAsk) / 2 : atmEntry.putLast || 0;
           if (callMid > 0 && putMid > 0) {
             impliedMove = parseFloat(((callMid + putMid) / spot * 100).toFixed(2));
           }
@@ -225,7 +312,7 @@ module.exports = async function handler(req, res) {
         spotVwap,
         spotChangePct,
         impliedMove,
-        expiration,
+        expiration: resolvedExpiration,
         contracts,
         source: 'polygon-realtime',
       });
@@ -234,11 +321,11 @@ module.exports = async function handler(req, res) {
       console.error('Error fetching options chain:', error);
       return res.status(200).json({
         contracts: [], symbol: sym, spot: 0, spotChangePct: 0, expiration,
+        source: 'polygon-error',
       });
     }
   }
 
-  // ─── No mode specified ────────────────────────────────────────────────────────
   return res.status(400).json({
     error: 'Either datesOnly=true or expiration parameter required',
     usage: 'GET /api/chain?symbol=TSLA&datesOnly=true  OR  GET /api/chain?symbol=TSLA&expiration=2026-06-20',
