@@ -67,7 +67,7 @@ async function fetchAllPages(initialUrl, _polygonKey) {
   }
 
   if (pageCount >= MAX_PAGES) {
-    console.warn(`[chain.js] Hit MAX_PAGES cap (${MAX_PAGES}) — some contracts may be missing`);
+    console.warn(`[chain.js] Hit MAX_PAGES (${MAX_PAGES}) — chain may be truncated`);
   }
 
   return results;
@@ -127,8 +127,6 @@ module.exports = async function handler(req, res) {
   }
 
   // ─── Helper: detect block trade from conditions array ─────────────────────────
-  // Polygon condition "41" = "Trade Thru Exempt" / large institutional block
-  // We also flag any last_trade.size > 50 contracts as a block print
   function isBlockTrade(contract) {
     const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
     if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
@@ -163,19 +161,18 @@ module.exports = async function handler(req, res) {
     }));
   }
 
-  // ─── MODE 1: Fetch available expiry dates ─────────────────────────────────────
+  // ─── MODE 1: Dates only ───────────────────────────────────────────────────────
   if (datesOnly === 'true') {
     try {
-      const sortedDates = await fetchExpiryDates(sym);
-      return res.status(200).json({ expiryDates: sortedDates, count: sortedDates.length });
-    } catch (error) {
-      console.error('Error fetching expiry dates:', error);
-      return res.status(200).json({ expiryDates: [] });
+      const dates = await fetchExpiryDates(sym);
+      return res.status(200).json({ symbol: sym, expiryDates: dates });
+    } catch (err) {
+      console.error('[chain.js] fetchExpiryDates error:', err.message);
+      return res.status(200).json({ symbol: sym, expiryDates: [] });
     }
   }
 
   // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
-  // Returns per-expiry GEX data across all upcoming expiries (for stacking)
   if (allExpiries === 'true') {
     try {
       const allDates = await fetchExpiryDates(sym);
@@ -198,27 +195,34 @@ module.exports = async function handler(req, res) {
               fetchAllPages(putsUrl, polygonKey),
             ]);
 
-            const strikeSet = new Set([
-              ...calls.map(c => c.details?.strike_price).filter(Boolean),
-              ...puts.map(p => p.details?.strike_price).filter(Boolean),
-            ]);
-
-            const strikes = Array.from(strikeSet).sort((a, b) => a - b).map(strike => {
-              const call = calls.find(c => c.details?.strike_price === strike);
-              const put  = puts.find(p => p.details?.strike_price === strike);
-              const callGamma = call?.greeks?.gamma ?? 0;
-              const putGamma  = put?.greeks?.gamma  ?? 0;
-              const callOI    = call?.open_interest ?? 0;
-              const putOI     = put?.open_interest  ?? 0;
-              const netGEX    = (callGamma * callOI - putGamma * putOI) * spot * 100;
-              return { strike, callGamma, putGamma, callOI, putOI, netGEX };
+            const strikeMap = new Map();
+            calls.forEach(c => {
+              const strike = c.details?.strike_price;
+              if (!strike) return;
+              const oi    = c.open_interest ?? 0;
+              const gamma = c.greeks?.gamma ?? 0;
+              if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
+              strikeMap.get(strike).callGEX = oi * gamma * spot * spot * 100;
+            });
+            puts.forEach(p => {
+              const strike = p.details?.strike_price;
+              if (!strike) return;
+              const oi    = p.open_interest ?? 0;
+              const gamma = p.greeks?.gamma ?? 0;
+              if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
+              strikeMap.get(strike).putGEX = oi * gamma * spot * spot * 100;
             });
 
-            const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
-            const dominantWall = strikes.reduce((best, s) =>
-              Math.abs(s.netGEX) > Math.abs(best?.netGEX ?? 0) ? s : best, null);
+            const strikes = Array.from(strikeMap.values()).map(s => ({
+              strike: s.strike,
+              netGEX: s.callGEX - s.putGEX,
+              callGEX: s.callGEX,
+              putGEX: s.putGEX,
+            }));
 
-            return { expiry: expDate, strikes, totalNetGEX, dominantWall };
+            const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
+
+            return { expiration: expDate, strikes, totalNetGEX };
           } catch {
             return null;
           }
@@ -356,7 +360,8 @@ module.exports = async function handler(req, res) {
           ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.callOI     = c.open_interest ?? 0;
-        entry.callVolume = c.volume        ?? 0;
+        // FIX: Polygon puts daily volume in c.day.volume — c.volume is often 0 or missing
+        entry.callVolume = c.day?.volume ?? c.volume ?? 0;
         // Phase 2 Greeks
         entry.callDelta  = c.greeks?.delta  ?? null;
         entry.callTheta  = c.greeks?.theta  ?? null;
@@ -396,7 +401,8 @@ module.exports = async function handler(req, res) {
           ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.putOI     = p.open_interest ?? 0;
-        entry.putVolume = p.volume        ?? 0;
+        // FIX: Polygon puts daily volume in p.day.volume — p.volume is often 0 or missing
+        entry.putVolume = p.day?.volume ?? p.volume ?? 0;
         entry.putDelta  = p.greeks?.delta  ?? null;
         entry.putTheta  = p.greeks?.theta  ?? null;
         entry.putGamma  = p.greeks?.gamma  ?? null;
