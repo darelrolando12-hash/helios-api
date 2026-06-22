@@ -2,11 +2,6 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 200;
 const MAX_PAGES = 10;
 
-// ─── IN-MEMORY SPOT CACHE (60s TTL) ───────────────────────────────────────────
-// Prevents duplicate spot price calls when multiple chain requests hit same ticker
-const spotCache = new Map(); // { symbol: { price, vwap, changePct, timestamp } }
-const SPOT_CACHE_TTL_MS = 60 * 1000; // 60 seconds
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -158,10 +153,18 @@ module.exports = async function handler(req, res) {
     // ─── MODE 2 & 3: Full chain data ────────────────────────────────────────────
     if (!expiration) return res.status(400).json({ error: 'expiration required' });
 
-    // Step 1: Get ALL contract references for the symbol (no expiry filter yet)
-    const refUrl = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${sym}&limit=1000&apiKey=${POLYGON_KEY}`;
-    const refJson = await polygonFetch(refUrl);
-    const allContracts = refJson?.results || [];
+    // Step 1: Get ALL contract references for the symbol with pagination
+    let allContracts = [];
+    let nextRefUrl = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${sym}&expiration_date=${expiration}&limit=1000&apiKey=${POLYGON_KEY}`;
+    let refPageCount = 0;
+
+    while (nextRefUrl && refPageCount < MAX_PAGES) {
+      const refJson = await polygonFetch(nextRefUrl);
+      const results = refJson?.results || [];
+      allContracts.push(...results);
+      nextRefUrl = refJson?.next_url ? `${refJson.next_url}&apiKey=${POLYGON_KEY}` : null;
+      refPageCount++;
+    }
     
     if (allContracts.length === 0) {
       return res.status(200).json({
@@ -186,6 +189,8 @@ module.exports = async function handler(req, res) {
       console.log(`[chain.js] Auto-slid to nearest date: ${resolvedExpiration}`);
     }
 
+    console.log(`[chain.js] ${sym} ${resolvedExpiration}: fetched ${allContracts.length} contracts in ${refPageCount} page(s)`);
+
     // Step 3: Fetch REAL snapshot data from Polygon (with pagination + retry)
     let allSnapshots = [];
     let nextUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?limit=250&apiKey=${POLYGON_KEY}`;
@@ -194,10 +199,14 @@ module.exports = async function handler(req, res) {
     while (nextUrl && pageCount < MAX_PAGES) {
       const snapshotJson = await polygonFetch(nextUrl);
       const results = snapshotJson?.results || [];
-      allSnapshots.push(...results);
+      
+      // Filter to match target expiration
+      const filtered = results.filter(s => s.details?.expiration_date === resolvedExpiration);
+      allSnapshots.push(...filtered);
+      
       nextUrl = snapshotJson?.next_url ? `${snapshotJson.next_url}&apiKey=${POLYGON_KEY}` : null;
       pageCount++;
-      console.log(`[chain.js] Fetched page ${pageCount}: ${results.length} contracts (total: ${allSnapshots.length})`);
+      console.log(`[chain.js] Fetched page ${pageCount}: ${filtered.length}/${results.length} contracts matched expiry (total: ${allSnapshots.length})`);
     }
 
     if (allSnapshots.length === 0) {
@@ -211,76 +220,20 @@ module.exports = async function handler(req, res) {
         source: 'polygon-no-snapshots',
       });
     }
-    
-    // Filter snapshots to match our target expiration
-    const allSnapshots = snapshotJson.results.filter(s => 
-      s.details.expiration_date === resolvedExpiration
-    );
 
-    // Step 4: Get spot price (CENTRALIZED via /api/quote with 60s cache)
-    // This eliminates duplicate Polygon calls when Dashboard + Chain load same ticker
-    let spot = 0;
-    let spotVwap = 0;
-    let spotChangePct = 0;
+    // Step 4: Get spot price — DIRECT POLYGON CALL (no middleman, no amplification)
+    const quoteUrl = `https://api.polygon.io/v2/aggs/ticker/${sym}/prev?apiKey=${POLYGON_KEY}`;
+    const quoteJson = await polygonFetch(quoteUrl);
+    const spot = quoteJson?.results?.[0]?.c ?? 0;
+    const spotVwap = quoteJson?.results?.[0]?.vw ?? spot;
+    const spotOpen = quoteJson?.results?.[0]?.o ?? spot;
+    const spotChangePct = spotOpen !== 0 ? ((spot - spotOpen) / spotOpen) * 100 : 0;
 
-    // Check cache first
-    const cached = spotCache.get(sym);
-    const now = Date.now();
-    if (cached && (now - cached.timestamp) < SPOT_CACHE_TTL_MS) {
-      console.log(`[chain.js] ✅ Using cached spot for ${sym}: $${cached.price.toFixed(2)}`);
-      spot = cached.price;
-      spotVwap = cached.vwap;
-      spotChangePct = cached.changePct;
-    } else {
-      // Cache miss — call our own quote API (which has fallback to Yahoo)
-      try {
-        const API_BASE = process.env.VERCEL_URL 
-          ? `https://${process.env.VERCEL_URL}` 
-          : 'https://helios-gex.vercel.app';
-        
-        const quoteRes = await fetch(`${API_BASE}/api/quote?symbol=${sym}`, {
-          signal: AbortSignal.timeout(5000),
-        });
-        
-        if (quoteRes.ok) {
-          const quoteData = await quoteRes.json();
-          spot = quoteData.price ?? 0;
-          spotVwap = quoteData.vwap ?? spot;
-          spotChangePct = quoteData.changePct ?? 0;
-          
-          // Cache for 60s
-          spotCache.set(sym, {
-            price: spot,
-            vwap: spotVwap,
-            changePct: spotChangePct,
-            timestamp: now,
-          });
-          console.log(`[chain.js] 🔄 Fetched fresh spot for ${sym}: $${spot.toFixed(2)} via /api/quote`);
-        } else {
-          console.warn(`[chain.js] Quote API failed for ${sym}, using Polygon fallback`);
-          // Fallback to direct Polygon call ONLY if quote API fails
-          const quoteUrl = `https://api.polygon.io/v2/aggs/ticker/${sym}/prev?apiKey=${POLYGON_KEY}`;
-          const quoteJson = await polygonFetch(quoteUrl);
-          spot = quoteJson?.results?.[0]?.c ?? 0;
-          spotVwap = quoteJson?.results?.[0]?.vw ?? spot;
-          const spotOpen = quoteJson?.results?.[0]?.o ?? spot;
-          spotChangePct = spotOpen !== 0 ? ((spot - spotOpen) / spotOpen) * 100 : 0;
-        }
-      } catch (err) {
-        console.error(`[chain.js] Error fetching spot for ${sym}:`, err.message);
-        // Last resort: direct Polygon
-        const quoteUrl = `https://api.polygon.io/v2/aggs/ticker/${sym}/prev?apiKey=${POLYGON_KEY}`;
-        const quoteJson = await polygonFetch(quoteUrl);
-        spot = quoteJson?.results?.[0]?.c ?? 0;
-        spotVwap = quoteJson?.results?.[0]?.vw ?? spot;
-        const spotOpen = quoteJson?.results?.[0]?.o ?? spot;
-        spotChangePct = spotOpen !== 0 ? ((spot - spotOpen) / spotOpen) * 100 : 0;
-      }
-    }
+    console.log(`[chain.js] ${sym} spot price: $${spot.toFixed(2)} (${spotChangePct >= 0 ? '+' : ''}${spotChangePct.toFixed(2)}%)`);
 
     // Step 5: Merge calls and puts by strike
-    const calls = allSnapshots.filter(s => s.details.contract_type === 'call');
-    const puts = allSnapshots.filter(s => s.details.contract_type === 'put');
+    const calls = allSnapshots.filter(s => s.details?.contract_type === 'call');
+    const puts = allSnapshots.filter(s => s.details?.contract_type === 'put');
 
     const contractMap = new Map();
 
@@ -305,8 +258,8 @@ module.exports = async function handler(req, res) {
 
     // Enrich with CALL data
     for (const c of calls) {
-      const strike = c.details.strike_price;
-      if (!contractMap.has(strike)) continue;
+      const strike = c.details?.strike_price;
+      if (!strike || !contractMap.has(strike)) continue;
       
       const entry = contractMap.get(strike);
       const day = c.day || {};
@@ -325,7 +278,7 @@ module.exports = async function handler(req, res) {
 
       contractMap.set(strike, {
         ...entry,
-        callTicker: c.details.ticker,
+        callTicker: c.details?.ticker,
         callBid: bid,
         callAsk: ask,
         callLast: c.last_trade?.price ?? 0,
@@ -345,8 +298,8 @@ module.exports = async function handler(req, res) {
 
     // Enrich with PUT data
     for (const p of puts) {
-      const strike = p.details.strike_price;
-      if (!contractMap.has(strike)) continue;
+      const strike = p.details?.strike_price;
+      if (!strike || !contractMap.has(strike)) continue;
       
       const entry = contractMap.get(strike);
       const day = p.day || {};
@@ -363,7 +316,7 @@ module.exports = async function handler(req, res) {
 
       contractMap.set(strike, {
         ...entry,
-        putTicker: p.details.ticker,
+        putTicker: p.details?.ticker,
         putBid: bid,
         putAsk: ask,
         putLast: p.last_trade?.price ?? 0,
