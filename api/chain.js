@@ -2,13 +2,6 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 200;
 const MAX_PAGES = 10;
 
-// Supabase client for Greeks retrieval
-import { createClient } from '@supabase/supabase-js';
-const supabase = createClient(
-  process.env.VITE_SUPABASE_URL,
-  process.env.VITE_SUPABASE_ANON_KEY
-);
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -45,119 +38,6 @@ async function polygonFetch(url, attempt = 1) {
     console.error('[chain.js] Polygon fetch failed after all retries:', err);
     return null;
   }
-}
-
-// ─── Market Hours Detection ───────────────────────────────────────────────────
-
-function isMarketOpen() {
-  try {
-    const now = new Date();
-    
-    // Get CT time components
-    const ctFormatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'America/Chicago',
-      weekday: 'short',
-      hour: 'numeric',
-      minute: 'numeric',
-      hour12: false,
-    });
-    
-    const parts = ctFormatter.formatToParts(now);
-    const weekday = parts.find(p => p.type === 'weekday')?.value;
-    const hour = parseInt(parts.find(p => p.type === 'hour')?.value ?? '0', 10);
-    const minute = parseInt(parts.find(p => p.type === 'minute')?.value ?? '0', 10);
-    
-    // Weekend check
-    if (weekday === 'Sat' || weekday === 'Sun') return false;
-    
-    // Market hours: 8:30 AM - 3:00 PM CT (9:30 AM - 4:00 PM ET)
-    const minutes = hour * 60 + minute;
-    const marketOpen = 8 * 60 + 30;  // 8:30 AM
-    const marketClose = 15 * 60;      // 3:00 PM
-    
-    return minutes >= marketOpen && minutes < marketClose;
-  } catch {
-    return true; // Default to market open if detection fails
-  }
-}
-
-// ─── Greeks Snapshot Retrieval ────────────────────────────────────────────────
-
-async function getStoredGreeks(symbol, expiry) {
-  try {
-    const { data, error } = await supabase
-      .from('greeks_snapshots')
-      .select('*')
-      .eq('symbol', symbol)
-      .eq('expiry', expiry)
-      .order('snapshot_time', { ascending: false })
-      .limit(500); // reasonable limit for one expiry
-
-    if (error) {
-      console.error('[chain.js] Supabase query error:', error);
-      return [];
-    }
-
-    if (!data || data.length === 0) {
-      console.log(`[chain.js] No stored Greeks found for ${symbol} ${expiry}`);
-      return [];
-    }
-
-    console.log(`[chain.js] ✓ Retrieved ${data.length} stored Greeks for ${symbol} ${expiry}`);
-    return data;
-  } catch (err) {
-    console.error('[chain.js] Failed to retrieve stored Greeks:', err);
-    return [];
-  }
-}
-
-function enrichContractsWithStoredGreeks(contracts, storedGreeks) {
-  if (!storedGreeks || storedGreeks.length === 0) return contracts;
-
-  // Build lookup map: strike -> stored Greeks row
-  const greeksMap = new Map();
-  for (const row of storedGreeks) {
-    greeksMap.set(Number(row.strike), row);
-  }
-
-  let enrichedCount = 0;
-
-  for (const contract of contracts) {
-    const stored = greeksMap.get(contract.strike);
-    if (!stored) continue;
-
-    // Enrich with real last-session Greeks
-    contract.callDelta = stored.call_delta ?? contract.callDelta;
-    contract.callTheta = stored.call_theta ?? contract.callTheta;
-    contract.callGamma = stored.call_gamma ?? contract.callGamma;
-    contract.callVega  = stored.call_vega  ?? contract.callVega;
-    contract.callVanna = stored.call_vanna ?? contract.callVanna;
-    contract.callCharm = stored.call_charm ?? contract.callCharm;
-
-    contract.putDelta = stored.put_delta ?? contract.putDelta;
-    contract.putTheta = stored.put_theta ?? contract.putTheta;
-    contract.putGamma = stored.put_gamma ?? contract.putGamma;
-    contract.putVega  = stored.put_vega  ?? contract.putVega;
-    contract.putVanna = stored.put_vanna ?? contract.putVanna;
-    contract.putCharm = stored.put_charm ?? contract.putCharm;
-
-    // Optionally enrich pricing if current Polygon data is stale
-    if (contract.callBid === 0 && stored.call_bid != null) {
-      contract.callBid = stored.call_bid;
-      contract.callAsk = stored.call_ask ?? contract.callAsk;
-      contract.callLast = stored.call_last ?? contract.callLast;
-    }
-    if (contract.putBid === 0 && stored.put_bid != null) {
-      contract.putBid = stored.put_bid;
-      contract.putAsk = stored.put_ask ?? contract.putAsk;
-      contract.putLast = stored.put_last ?? contract.putLast;
-    }
-
-    enrichedCount++;
-  }
-
-  console.log(`[chain.js] Enriched ${enrichedCount}/${contracts.length} contracts with stored Greeks`);
-  return contracts;
 }
 
 // ─── Main Handler ─────────────────────────────────────────────────────────────
@@ -438,24 +318,7 @@ export default async (req, res) => {
       entry.putBlock = conditions.includes('41') || (p.last_trade?.size ?? 0) > 100;
     }
 
-    let contracts = Array.from(contractMap.values()).sort((a, b) => a.strike - b.strike);
-
-    // ─── NEW: Phase 3.5 — Enrich with stored Greeks if market is closed ───────────
-
-    const marketOpen = isMarketOpen();
-    let dataSource = 'polygon-realtime';
-
-    if (!marketOpen) {
-      console.log(`[chain.js] Market closed — checking for stored Greeks for ${sym} ${resolvedExpiration}`);
-      const storedGreeks = await getStoredGreeks(sym, resolvedExpiration);
-      if (storedGreeks.length > 0) {
-        contracts = enrichContractsWithStoredGreeks(contracts, storedGreeks);
-        dataSource = 'polygon-last-session';
-      } else {
-        console.log(`[chain.js] No stored Greeks found — Greeks will be null`);
-        dataSource = 'polygon-stale';
-      }
-    }
+    const contracts = Array.from(contractMap.values()).sort((a, b) => a.strike - b.strike);
 
     // Step 6: Compute chain-level metrics (Phase 3)
 
@@ -529,7 +392,7 @@ export default async (req, res) => {
       putOIWalls,
       blockCallCount,
       blockPutCount,
-      source: dataSource,
+      source: 'polygon-realtime',
     });
 
   } catch (error) {
