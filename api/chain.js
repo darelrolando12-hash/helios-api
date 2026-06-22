@@ -191,17 +191,17 @@ module.exports = async (req, res) => {
       }
 
       const tickers = allContracts.map(r => r.ticker);
-      const BATCH_SIZE = 250;
+      
+      // Use chain snapshot endpoint (single call for all contracts)
+      const snapshotUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?apiKey=${POLYGON_KEY}`;
+      const snapshotJson = await polygonFetch(snapshotUrl);
+      
       let allSnapshots = [];
-
-      for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
-        const batch = tickers.slice(i, i + BATCH_SIZE);
-        const snapshotUrl = `https://api.polygon.io/v3/snapshot/options/${sym}/${encodeURIComponent(batch.join(','))}?apiKey=${POLYGON_KEY}`;
-        const snapshotJson = await polygonFetch(snapshotUrl);
-        if (snapshotJson && snapshotJson.results) {
-          allSnapshots = allSnapshots.concat(snapshotJson.results);
-        }
-        if (i + BATCH_SIZE < tickers.length) await sleep(100);
+      if (snapshotJson && snapshotJson.results) {
+        // Filter to only this expiry
+        allSnapshots = snapshotJson.results.filter(s => 
+          s.details.expiration_date === expiry
+        );
       }
 
       let gexData = allSnapshots.map(s => ({
@@ -303,20 +303,22 @@ module.exports = async (req, res) => {
       });
     }
 
-    // Step 3: Fetch snapshots in batches
-    const tickers = allContracts.map(r => r.ticker);
-    const BATCH_SIZE = 250;
-    let allSnapshots = [];
-
-    for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
-      const batch = tickers.slice(i, i + BATCH_SIZE);
-      const snapshotUrl = `https://api.polygon.io/v3/snapshot/options/${sym}/${encodeURIComponent(batch.join(','))}?apiKey=${POLYGON_KEY}`;
-      const snapshotJson = await polygonFetch(snapshotUrl);
-      if (snapshotJson && snapshotJson.results) {
-        allSnapshots = allSnapshots.concat(snapshotJson.results);
-      }
-      if (i + BATCH_SIZE < tickers.length) await sleep(100);
+    // Step 3: Fetch ALL snapshots using chain snapshot endpoint (single call)
+    const snapshotUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?apiKey=${POLYGON_KEY}`;
+    const snapshotJson = await polygonFetch(snapshotUrl);
+    
+    if (!snapshotJson || !snapshotJson.results) {
+      console.log('[chain.js] No snapshot data returned from Polygon');
+      return res.status(200).json({
+        contracts: [], symbol: sym, spot: 0, spotChangePct: 0, expiration: resolvedExpiration,
+        source: 'polygon-no-snapshots',
+      });
     }
+    
+    // Filter snapshots to match our target expiration
+    const allSnapshots = snapshotJson.results.filter(s => 
+      s.details.expiration_date === resolvedExpiration
+    );
 
     // Step 4: Get spot price
     const quoteUrl = `https://api.polygon.io/v2/aggs/ticker/${sym}/prev?apiKey=${POLYGON_KEY}`;
