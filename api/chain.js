@@ -174,6 +174,7 @@ module.exports = async (req, res) => {
 
     const allDates = [...new Set(datesJson.results.map(r => r.expiration_date))].sort();
     const targetExpiries = allDates.slice(0, 5);
+    const marketOpen = isMarketOpen();
     const result = [];
 
     for (const expiry of targetExpiries) {
@@ -203,18 +204,51 @@ module.exports = async (req, res) => {
         if (i + BATCH_SIZE < tickers.length) await sleep(100);
       }
 
-      const gexData = allSnapshots.map(s => ({
+      let gexData = allSnapshots.map(s => ({
         strike: s.details.strike_price,
-        callGamma: s.greeks?.gamma || 0,
-        putGamma: s.greeks?.gamma || 0,
+        callGamma: s.greeks?.gamma || null,
+        putGamma: s.greeks?.gamma || null,
         callOI: s.open_interest || 0,
         putOI: s.open_interest || 0,
+      }));
+
+      // NEW: If market closed and gamma is null, enrich with stored Greeks
+      if (!marketOpen) {
+        const snapshots = await fetchGreeksSnapshot(sym, expiry);
+        if (snapshots.length > 0) {
+          const greeksMap = new Map();
+          for (const snap of snapshots) {
+            greeksMap.set(snap.strike, snap);
+          }
+
+          for (const contract of gexData) {
+            const stored = greeksMap.get(contract.strike);
+            if (!stored) continue;
+            
+            if (contract.callGamma === null && stored.call_gamma !== null) {
+              contract.callGamma = stored.call_gamma;
+            }
+            if (contract.putGamma === null && stored.put_gamma !== null) {
+              contract.putGamma = stored.put_gamma;
+            }
+          }
+        }
+      }
+
+      // Convert null to 0 for GEX calculations
+      gexData = gexData.map(c => ({
+        ...c,
+        callGamma: c.callGamma ?? 0,
+        putGamma: c.putGamma ?? 0,
       }));
 
       result.push({ expiry, contracts: gexData });
     }
 
-    return res.status(200).json({ expiries: result });
+    return res.status(200).json({ 
+      expiries: result,
+      source: marketOpen ? 'polygon-realtime' : 'polygon-last-session'
+    });
   }
 
   // Mode 3: Single expiry full chain
