@@ -55,7 +55,7 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ─── Normalize messages (with vision support) ─────────────────────────────────
+// ─── Normalize messages ────────────────────────────────────────────────────────
 
 function normalizeMessages(messages) {
   var filtered = messages.filter(function(m) {
@@ -143,7 +143,7 @@ function parseIntent(aiReply, messages) {
   return null;
 }
 
-// ─── System prompt builder — ALL 7 LAYERS ─────────────────────────────────────
+// ─── System prompt builder — ALL 7 LAYERS + SIGNAL AUTOPSY ───────────────────
 
 function buildSystemPrompt(context) {
   var mode          = context.mode ?? 'chat';
@@ -166,7 +166,10 @@ function buildSystemPrompt(context) {
   var disciplineCtx = context.disciplineCtx ?? '';
   var activeCtx     = context.activeCtx     ?? '';
   var optionsFlow   = context.optionsFlow   ?? '';
+  // Layer 0: Rich session context from client
   var sessionContext = context.sessionContext ?? '';
+  // Counterfactual: skipped signal outcomes
+  var counterfactual = context.counterfactual ?? null;
 
   void mode;
 
@@ -237,6 +240,29 @@ function buildSystemPrompt(context) {
     riskTolerance ? 'Risk tolerance: ' + riskTolerance : '',
     tradeHistory  ? 'Trade history note: ' + tradeHistory : '',
   ].filter(Boolean).join(' | ') || 'Profile not set';
+
+  // ── Build counterfactual section ─────────────────────────────────────────────
+  var counterfactualSection = (function() {
+    if (!counterfactual || !counterfactual.stats || counterfactual.stats.totalSignals === 0) return '';
+    var s = counterfactual.stats;
+    var lines = ['═══ SESSION SIGNAL AUTOPSY (What You Left On The Table) ═══'];
+    lines.push('Signals fired: ' + s.totalSignals + ' | Taken: ' + (s.totalSignals - s.skippedSignals) + ' | Skipped: ' + s.skippedSignals);
+    lines.push('Taken win rate: ' + s.takenWinRate + '% | Skipped signal win rate: ' + s.skippedWinRate + '%');
+    if (s.missedElites > 0) lines.push('MISSED ELITE setups (100%+ options gain): ' + s.missedElites);
+    if (s.missedWins > 0)   lines.push('Missed wins (any positive outcome skipped): ' + s.missedWins);
+    if (counterfactual.skippedSignals && counterfactual.skippedSignals.length > 0) {
+      lines.push('');
+      lines.push('Resolved skipped signals:');
+      counterfactual.skippedSignals.forEach(function(sig) {
+        var move = sig.movePct != null ? (sig.movePct >= 0 ? '+' : '') + sig.movePct.toFixed(1) + '%' : '?';
+        var pnl  = sig.optionPnlProxy != null ? ' (~option: ' + (sig.optionPnlProxy >= 0 ? '+' : '') + sig.optionPnlProxy.toFixed(0) + '%)' : '';
+        lines.push('  ' + sig.symbol + ' ' + sig.direction.toUpperCase() + ' @ $' + sig.entryPrice + ' [' + sig.firedAt + '] → moved ' + move + pnl + ' | ' + sig.outcome.toUpperCase());
+      });
+    }
+    lines.push('');
+    lines.push('When user asks about missed trades or what they left on the table — use THIS data. Be direct and specific.');
+    return lines.join('\n') + '\n';
+  })();
 
   var optionsKnowledge = [
     '═══════════════════════════════════════════════════════════════════',
@@ -363,6 +389,10 @@ function buildSystemPrompt(context) {
     brainCombos   ? brainCombos   + '\n' : '',
     disciplineCtx ? disciplineCtx + '\n' : '',
     activeCtx     ? activeCtx     + '\n' : '',
+
+    // ── Counterfactual: skipped signal autopsy ────────────────────────────────
+    counterfactualSection,
+
     optionsKnowledge,
     '',
     '═══ RESPONSE RULES — NEVER BREAK ═══',
@@ -401,6 +431,12 @@ function buildSystemPrompt(context) {
     '33. POST-FOMC: "First FOMC move is almost always a fake-out. Wait 10-15 min for real direction."',
     '34. IV CRUSH WARNING: If big event < 120 min away with open positions, warn about IV collapse.',
     '35. STRADDLE WINDOW: If FOMC 90-30 min away, suggest ATM straddle.',
+    '36. GEO RISK: If elevated, tighten stops 10%, avoid new swings.',
+    '37. LIVE DATA: NEVER say you lack live data. Always proceed with analysis.',
+    '38. NEVER ASK FOR DATA: You have market access. Use it. Never ask user for prices or IV.',
+    '39. MISSED TRADES AUTOPSY: When user asks "what did I miss?", "what did I leave on the table?", "session autopsy", "what signals did I skip?", or similar — use the SESSION SIGNAL AUTOPSY section above. List every skipped signal with its outcome and estimated option P&L, calculate the total missed gains, identify the single best setup they passed on. Be direct and specific. NEVER ask them questions or say you need more info.',
+  ].filter(Boolean).join('\n');
+}
     '36. GEO RISK: If elevated, tighten stops 10%, avoid new swings.',
     '37. LIVE DATA: NEVER say you lack live data. Always proceed with analysis.',
     '38. NEVER ASK FOR DATA: You have market access. Use it. Never ask user for prices or IV.',
