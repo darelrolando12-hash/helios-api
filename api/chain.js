@@ -96,19 +96,9 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // ─── Helper: fetch spot price — multi-source, guaranteed to work 24/7 ──────────
-  //
-  // SOURCE ORDER (most accurate → most reliable):
-  // 1. v2/aggs/ticker/{sym}/prev  — previous day OHLCV (always works, no 403, 24/7)
-  //    → gives us prevClose (for % change) and a reliable price fallback
-  // 2. v2/last/stocks/{sym}       — last trade price (live during market hours)
-  //    → gives us real-time price when market is open
-  //
-  // The old v2/snapshot/locale/us/markets/stocks/tickers/{sym} endpoint was
-  // returning 403 Forbidden, which made spot=0, which made ALL GEX values = 0.
+  // ─── Helper: fetch spot price ─────────────────────────────────────────────
   async function fetchSpot(ticker) {
     try {
-      // Always fetch prev-day agg first — works 24/7, no permission issues
       const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${polygonKey}`;
       const prevR = await polygonFetch(prevUrl);
       let prevClose = 0;
@@ -122,7 +112,6 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Try to get the live last trade price (works during market hours)
       let livePrice = 0;
       try {
         const lastUrl = `https://api.polygon.io/v2/last/stocks/${ticker}?apiKey=${polygonKey}`;
@@ -132,21 +121,18 @@ module.exports = async function handler(req, res) {
           livePrice = lastData?.results?.p ?? lastData?.last?.price ?? 0;
         }
       } catch {
-        // live price unavailable — not a failure, use prevClose below
+        // live price unavailable — use prevClose
       }
 
-      // Best price: live trade if available, otherwise prev session close
       const price = livePrice > 0 ? livePrice : prevClose;
-
       console.log(`[chain.js] fetchSpot ${ticker}: livePrice=${livePrice}, prevClose=${prevClose}, using=${price}`);
-
       return { price, prevClose, vwap: prevVwap };
     } catch {
       return { price: 0, prevClose: 0, vwap: 0 };
     }
   }
 
-  // ─── Helper: fetch all real expiry dates for a symbol ────────────────────────
+  // ─── Helper: fetch all real expiry dates ─────────────────────────────────
   async function fetchExpiryDates(ticker) {
     const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
     const r = await polygonFetch(url);
@@ -159,15 +145,15 @@ module.exports = async function handler(req, res) {
     return Array.from(dates).sort();
   }
 
-  // ─── Helper: detect block trade from conditions array ─────────────────────────
+  // ─── Helper: detect block trade ──────────────────────────────────────────
   function isBlockTrade(contract) {
-    const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
+    const conditions = contract.day?.conditions ?? contract.last_trade?.conditions ?? [];
     if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
-    const lastSize = contract.market_data?.last_trade?.size ?? 0;
+    const lastSize = contract.last_trade?.size ?? 0;
     return lastSize >= 50;
   }
 
-  // ─── Helper: compute volume-weighted IV for a side ───────────────────────────
+  // ─── Helper: volume-weighted IV ──────────────────────────────────────────
   function computeVWIV(contracts, side) {
     let totalVol = 0;
     let weightedIV = 0;
@@ -182,7 +168,7 @@ module.exports = async function handler(req, res) {
     return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
   }
 
-  // ─── Helper: find top OI concentration walls ────────────────────────────────
+  // ─── Helper: OI concentration walls ─────────────────────────────────────
   function findOIWalls(contracts, side) {
     const sorted = [...contracts]
       .filter(c => side === 'call' ? c.callOI > 0 : c.putOI > 0)
@@ -194,7 +180,7 @@ module.exports = async function handler(req, res) {
     }));
   }
 
-  // ─── MODE 1: Fetch available expiry dates ─────────────────────────────────────
+  // ─── MODE 1: Expiry dates only ────────────────────────────────────────────
   if (datesOnly === 'true') {
     try {
       const sortedDates = await fetchExpiryDates(sym);
@@ -205,7 +191,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
+  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────
   if (allExpiries === 'true') {
     try {
       const allDates = await fetchExpiryDates(sym);
@@ -273,10 +259,10 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── MODE 2: Full options chain ───────────────────────────────────────────────
+  // ─── MODE 2: Full options chain ───────────────────────────────────────────
   if (expiration) {
     try {
-      // ── Date validation ──────────────────────────────────────────────────────
+      // Date validation — slide to nearest valid date if needed
       let resolvedExpiration = expiration;
       const validDates = await fetchExpiryDates(sym);
       const isValidDate = validDates.includes(expiration);
@@ -288,7 +274,7 @@ module.exports = async function handler(req, res) {
         resolvedExpiration = nearest;
       }
 
-      // ── Fetch all calls and puts with pagination ──────────────────────────────
+      // Fetch calls and puts with pagination
       const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
       const putsBaseUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
@@ -312,9 +298,7 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      // ── Spot price extraction ────────────────────────────────────────────────
-      // Primary: Polygon puts the underlying price directly in the options snapshot response
-      // Fallback: fetchSpot() — uses v2/aggs/prev + v2/last/stocks
+      // Spot price — from options snapshot first, then fallback
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
@@ -337,7 +321,7 @@ module.exports = async function handler(req, res) {
         ? ((spot - spotPrevClose) / spotPrevClose) * 100
         : 0;
 
-      // ── Build contract map by strike ─────────────────────────────────────────
+      // Build contract map by strike
       const contractMap = new Map();
 
       function ensureStrike(strike) {
@@ -360,17 +344,16 @@ module.exports = async function handler(req, res) {
         return contractMap.get(strike);
       }
 
-      // ── Process calls ─────────────────────────────────────────────────────────
+      // Process calls
+      // FIX: bid/ask read from c.last_quote (correct Polygon v3 path), NOT c.market_data
       callsResults.forEach(c => {
         const strike = c.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
 
-        const bid = c.market_data?.bid ?? 0;
-        const ask = c.market_data?.ask ?? 0;
-        const lastTradePrice = c.market_data?.last_trade?.price
-          ?? c.market_data?.last_quote?.midpoint
-          ?? 0;
+        const bid           = c.last_quote?.bid ?? 0;
+        const ask           = c.last_quote?.ask ?? 0;
+        const lastTradePrice = c.last_trade?.price ?? c.last_quote?.midpoint ?? 0;
 
         entry.callBid    = bid;
         entry.callAsk    = ask;
@@ -382,7 +365,7 @@ module.exports = async function handler(req, res) {
         entry.callVolume = c.day?.volume ?? c.volume ?? 0;
         entry.callDelta  = c.greeks?.delta  ?? null;
         entry.callTheta  = c.greeks?.theta  ?? null;
-        entry.callGamma  = c.greeks?.gamma  ?? null;  // REAL gamma only — NO FAKE ESTIMATION
+        entry.callGamma  = c.greeks?.gamma  ?? null;
         entry.callVega   = c.greeks?.vega   ?? null;
         entry.callVanna  = c.greeks?.vanna  ?? null;
         entry.callCharm  = c.greeks?.charm  ?? null;
@@ -395,17 +378,16 @@ module.exports = async function handler(req, res) {
         entry.callIlliquid   = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
-      // ── Process puts ──────────────────────────────────────────────────────────
+      // Process puts
+      // FIX: same bid/ask path fix for puts
       putsResults.forEach(p => {
         const strike = p.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
 
-        const bid = p.market_data?.bid ?? 0;
-        const ask = p.market_data?.ask ?? 0;
-        const lastTradePrice = p.market_data?.last_trade?.price
-          ?? p.market_data?.last_quote?.midpoint
-          ?? 0;
+        const bid           = p.last_quote?.bid ?? 0;
+        const ask           = p.last_quote?.ask ?? 0;
+        const lastTradePrice = p.last_trade?.price ?? p.last_quote?.midpoint ?? 0;
 
         entry.putBid    = bid;
         entry.putAsk    = ask;
@@ -417,7 +399,7 @@ module.exports = async function handler(req, res) {
         entry.putVolume = p.day?.volume ?? p.volume ?? 0;
         entry.putDelta  = p.greeks?.delta  ?? null;
         entry.putTheta  = p.greeks?.theta  ?? null;
-        entry.putGamma  = p.greeks?.gamma  ?? null;  // REAL gamma only — NO FAKE ESTIMATION
+        entry.putGamma  = p.greeks?.gamma  ?? null;
         entry.putVega   = p.greeks?.vega   ?? null;
         entry.putVanna  = p.greeks?.vanna  ?? null;
         entry.putCharm  = p.greeks?.charm  ?? null;
@@ -430,12 +412,12 @@ module.exports = async function handler(req, res) {
         entry.putIlliquid   = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
-      // ── ATM / ITM flags using real spot ─────────────────────────────────────
-      const strikeStep = spot < 10  ? 0.5
-                       : spot < 50  ? 1
-                       : spot < 200 ? 5
-                       : spot < 500 ? 10
-                       : 25;
+      // ATM / ITM flags
+      const strikeStep = spot < 10 ? 0.5
+        : spot < 50  ? 1
+        : spot < 200 ? 5
+        : spot < 500 ? 10
+        : 25;
 
       const contracts = Array.from(contractMap.values())
         .sort((a, b) => a.strike - b.strike)
@@ -446,7 +428,7 @@ module.exports = async function handler(req, res) {
           itmPut:  spot > 0 ? c.strike > spot : false,
         }));
 
-      // ── ATM straddle implied move (straddle price method — more accurate than IV approx) ──
+      // ATM straddle implied move
       let impliedMove = null;
       if (spot > 0) {
         const atmEntry = contracts.find(c => c.atm);
@@ -463,34 +445,28 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // ── Phase 3: Volume-Weighted IV (VWIV) ──────────────────────────────────
+      // Phase 3: VWIV + OI Walls + Block trades
       const vwivCall = computeVWIV(contracts, 'call');
       const vwivPut  = computeVWIV(contracts, 'put');
-
-      // ── Phase 3: OI Concentration Walls ─────────────────────────────────────
       const callOIWalls = findOIWalls(contracts, 'call');
       const putOIWalls  = findOIWalls(contracts, 'put');
-
-      // ── Phase 3: Block trade summary ────────────────────────────────────────
       const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
       const blockPutCount  = contracts.filter(c => c.putBlockTrade).length;
 
-      // ── Diagnostic: log gamma and bid/ask availability ───────────────────────
+      // Diagnostic log — confirm bid/ask is now populating
       const gammaCount = contracts.filter(c => c.callGamma !== null || c.putGamma !== null).length;
       const sampleContracts = contracts.slice(0, 3).map(c => ({
-        strike: c.strike,
+        strike:    c.strike,
+        callBid:   c.callBid,
+        callAsk:   c.callAsk,
+        callLast:  c.callLast,
+        putBid:    c.putBid,
+        putAsk:    c.putAsk,
+        putLast:   c.putLast,
         callGamma: c.callGamma,
-        putGamma: c.putGamma,
         callDelta: c.callDelta,
-        putDelta: c.putDelta,
-        callLast: c.callLast,
-        putLast: c.putLast,
-        callBid: c.callBid,
-        callAsk: c.callAsk,
-        putBid: c.putBid,
-        putAsk: c.putAsk,
       }));
-      console.log(`[chain.js] Gamma status: ${gammaCount}/${contracts.length} contracts have gamma data`);
+      console.log(`[chain.js] Gamma: ${gammaCount}/${contracts.length} contracts have gamma`);
       console.log(`[chain.js] Spot: ${spot} (prevClose: ${spotPrevClose}, change: ${spotChangePct.toFixed(2)}%)`);
       console.log('[chain.js] Sample:', JSON.stringify(sampleContracts, null, 2));
 
@@ -520,7 +496,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── No mode specified ────────────────────────────────────────────────────────
+  // ─── No mode specified ────────────────────────────────────────────────────
   return res.status(400).json({
     error: 'Either datesOnly=true, expiration, or allExpiries=true required',
     usage: 'GET /api/chain?symbol=TSLA&datesOnly=true  OR  /api/chain?symbol=TSLA&expiration=2026-06-20  OR  /api/chain?symbol=TSLA&allExpiries=true',
