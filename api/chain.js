@@ -96,7 +96,6 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // ─── Helper: fetch spot price ─────────────────────────────────────────────
   async function fetchSpot(ticker) {
     try {
       const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${polygonKey}`;
@@ -132,7 +131,6 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── Helper: fetch all real expiry dates ─────────────────────────────────
   async function fetchExpiryDates(ticker) {
     const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
     const r = await polygonFetch(url);
@@ -145,7 +143,6 @@ module.exports = async function handler(req, res) {
     return Array.from(dates).sort();
   }
 
-  // ─── Helper: detect block trade ──────────────────────────────────────────
   function isBlockTrade(contract) {
     const conditions = contract.day?.conditions ?? contract.last_trade?.conditions ?? [];
     if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
@@ -153,7 +150,6 @@ module.exports = async function handler(req, res) {
     return lastSize >= 50;
   }
 
-  // ─── Helper: volume-weighted IV ──────────────────────────────────────────
   function computeVWIV(contracts, side) {
     let totalVol = 0;
     let weightedIV = 0;
@@ -168,7 +164,6 @@ module.exports = async function handler(req, res) {
     return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
   }
 
-  // ─── Helper: OI concentration walls ─────────────────────────────────────
   function findOIWalls(contracts, side) {
     const sorted = [...contracts]
       .filter(c => side === 'call' ? c.callOI > 0 : c.putOI > 0)
@@ -262,7 +257,6 @@ module.exports = async function handler(req, res) {
   // ─── MODE 2: Full options chain ───────────────────────────────────────────
   if (expiration) {
     try {
-      // Date validation — slide to nearest valid date if needed
       let resolvedExpiration = expiration;
       const validDates = await fetchExpiryDates(sym);
       const isValidDate = validDates.includes(expiration);
@@ -274,7 +268,6 @@ module.exports = async function handler(req, res) {
         resolvedExpiration = nearest;
       }
 
-      // Fetch calls and puts with pagination
       const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
       const putsBaseUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
@@ -298,18 +291,15 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      // Spot price — from options snapshot first, then fallback
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
-
       const ua = callsResults[0]?.underlying_asset ?? putsResults[0]?.underlying_asset ?? null;
       if (ua && ua.price > 0) {
         spot = ua.price;
         spotPrevClose = ua.day?.prev_close ?? ua.day?.c ?? 0;
         spotVwap = ua.day?.vw ?? 0;
       }
-
       if (spot <= 0) {
         const fallback = await fetchSpot(sym);
         spot = fallback.price;
@@ -321,9 +311,7 @@ module.exports = async function handler(req, res) {
         ? ((spot - spotPrevClose) / spotPrevClose) * 100
         : 0;
 
-      // Build contract map by strike
       const contractMap = new Map();
-
       function ensureStrike(strike) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
@@ -344,77 +332,68 @@ module.exports = async function handler(req, res) {
         return contractMap.get(strike);
       }
 
-      // Process calls
-      // FIX: bid/ask read from c.last_quote (correct Polygon v3 path), NOT c.market_data
       callsResults.forEach(c => {
         const strike = c.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
-
-        const bid           = c.last_quote?.bid ?? 0;
-        const ask           = c.last_quote?.ask ?? 0;
+        const bid = c.last_quote?.bid ?? 0;
+        const ask = c.last_quote?.ask ?? 0;
         const lastTradePrice = c.last_trade?.price ?? c.last_quote?.midpoint ?? 0;
-
-        entry.callBid    = bid;
-        entry.callAsk    = ask;
-        entry.callLast   = lastTradePrice;
-        entry.callIV     = c.greeks?.implied_volatility != null
+        entry.callBid = bid;
+        entry.callAsk = ask;
+        entry.callLast = lastTradePrice;
+        entry.callIV = c.greeks?.implied_volatility != null
           ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
           : 0;
-        entry.callOI     = c.open_interest ?? 0;
+        entry.callOI = c.open_interest ?? 0;
         entry.callVolume = c.day?.volume ?? c.volume ?? 0;
-        entry.callDelta  = c.greeks?.delta  ?? null;
-        entry.callTheta  = c.greeks?.theta  ?? null;
-        entry.callGamma  = c.greeks?.gamma  ?? null;
-        entry.callVega   = c.greeks?.vega   ?? null;
-        entry.callVanna  = c.greeks?.vanna  ?? null;
-        entry.callCharm  = c.greeks?.charm  ?? null;
-        entry.callDayVol     = c.day?.volume      ?? 0;
+        entry.callDelta = c.greeks?.delta ?? null;
+        entry.callTheta = c.greeks?.theta ?? null;
+        entry.callGamma = c.greeks?.gamma ?? null;
+        entry.callVega  = c.greeks?.vega  ?? null;
+        entry.callVanna = c.greeks?.vanna ?? null;
+        entry.callCharm = c.greeks?.charm ?? null;
+        entry.callDayVol = c.day?.volume ?? 0;
         entry.callPrevDayVol = c.prev_day?.volume ?? 0;
         entry.callVolumeRatio = entry.callPrevDayVol > 0
           ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
           : null;
         entry.callBlockTrade = isBlockTrade(c);
-        entry.callIlliquid   = ask > 0 && (ask - bid) / ask > 0.5;
+        entry.callIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
-      // Process puts
-      // FIX: same bid/ask path fix for puts
       putsResults.forEach(p => {
         const strike = p.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
-
-        const bid           = p.last_quote?.bid ?? 0;
-        const ask           = p.last_quote?.ask ?? 0;
+        const bid = p.last_quote?.bid ?? 0;
+        const ask = p.last_quote?.ask ?? 0;
         const lastTradePrice = p.last_trade?.price ?? p.last_quote?.midpoint ?? 0;
-
-        entry.putBid    = bid;
-        entry.putAsk    = ask;
-        entry.putLast   = lastTradePrice;
-        entry.putIV     = p.greeks?.implied_volatility != null
+        entry.putBid = bid;
+        entry.putAsk = ask;
+        entry.putLast = lastTradePrice;
+        entry.putIV = p.greeks?.implied_volatility != null
           ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
           : 0;
-        entry.putOI     = p.open_interest ?? 0;
+        entry.putOI = p.open_interest ?? 0;
         entry.putVolume = p.day?.volume ?? p.volume ?? 0;
-        entry.putDelta  = p.greeks?.delta  ?? null;
-        entry.putTheta  = p.greeks?.theta  ?? null;
-        entry.putGamma  = p.greeks?.gamma  ?? null;
-        entry.putVega   = p.greeks?.vega   ?? null;
-        entry.putVanna  = p.greeks?.vanna  ?? null;
-        entry.putCharm  = p.greeks?.charm  ?? null;
-        entry.putDayVol     = p.day?.volume      ?? 0;
+        entry.putDelta = p.greeks?.delta ?? null;
+        entry.putTheta = p.greeks?.theta ?? null;
+        entry.putGamma = p.greeks?.gamma ?? null;
+        entry.putVega  = p.greeks?.vega  ?? null;
+        entry.putVanna = p.greeks?.vanna ?? null;
+        entry.putCharm = p.greeks?.charm ?? null;
+        entry.putDayVol = p.day?.volume ?? 0;
         entry.putPrevDayVol = p.prev_day?.volume ?? 0;
         entry.putVolumeRatio = entry.putPrevDayVol > 0
           ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2))
           : null;
         entry.putBlockTrade = isBlockTrade(p);
-        entry.putIlliquid   = ask > 0 && (ask - bid) / ask > 0.5;
+        entry.putIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
-      // ATM / ITM flags
       const strikeStep = spot < 10 ? 0.5
-        : spot < 50  ? 1
+        : spot < 50 ? 1
         : spot < 200 ? 5
         : spot < 500 ? 10
         : 25;
@@ -423,12 +402,11 @@ module.exports = async function handler(req, res) {
         .sort((a, b) => a.strike - b.strike)
         .map(c => ({
           ...c,
-          atm:     spot > 0 && Math.abs(c.strike - spot) < Math.max(strikeStep * 0.6, 1),
+          atm: spot > 0 && Math.abs(c.strike - spot) < Math.max(strikeStep * 0.6, 1),
           itmCall: spot > 0 ? c.strike < spot : false,
           itmPut:  spot > 0 ? c.strike > spot : false,
         }));
 
-      // ATM straddle implied move
       let impliedMove = null;
       if (spot > 0) {
         const atmEntry = contracts.find(c => c.atm);
@@ -445,7 +423,6 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Phase 3: VWIV + OI Walls + Block trades
       const vwivCall = computeVWIV(contracts, 'call');
       const vwivPut  = computeVWIV(contracts, 'put');
       const callOIWalls = findOIWalls(contracts, 'call');
@@ -453,18 +430,12 @@ module.exports = async function handler(req, res) {
       const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
       const blockPutCount  = contracts.filter(c => c.putBlockTrade).length;
 
-      // Diagnostic log — confirm bid/ask is now populating
       const gammaCount = contracts.filter(c => c.callGamma !== null || c.putGamma !== null).length;
       const sampleContracts = contracts.slice(0, 3).map(c => ({
-        strike:    c.strike,
-        callBid:   c.callBid,
-        callAsk:   c.callAsk,
-        callLast:  c.callLast,
-        putBid:    c.putBid,
-        putAsk:    c.putAsk,
-        putLast:   c.putLast,
-        callGamma: c.callGamma,
-        callDelta: c.callDelta,
+        strike: c.strike,
+        callBid: c.callBid, callAsk: c.callAsk, callLast: c.callLast,
+        putBid: c.putBid, putAsk: c.putAsk, putLast: c.putLast,
+        callGamma: c.callGamma, callDelta: c.callDelta,
       }));
       console.log(`[chain.js] Gamma: ${gammaCount}/${contracts.length} contracts have gamma`);
       console.log(`[chain.js] Spot: ${spot} (prevClose: ${spotPrevClose}, change: ${spotChangePct.toFixed(2)}%)`);
