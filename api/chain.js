@@ -1,6 +1,18 @@
 const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 200;
+const RETRY_DELAY_MS = 400;
 const MAX_PAGES = 10;
+
+// Index ticker normalization — same as quote.js
+const INDEX_TICKER_MAP = { SPX: 'I:SPX', SPXW: 'I:SPX', NDX: 'I:NDX', VIX: 'I:VIX' };
+
+function toPolygonAggTicker(ticker) {
+  if (ticker.startsWith('^')) return ticker.replace('^', 'I:');
+  return INDEX_TICKER_MAP[ticker] ?? ticker;
+}
+
+function isIndexTicker(ticker) {
+  return !!(INDEX_TICKER_MAP[ticker] || ticker.startsWith('^') || ticker.startsWith('I:'));
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -12,7 +24,7 @@ async function polygonFetch(url, attempt = 1) {
 
     if (res.status === 429) {
       if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt * 2);
+        await sleep(RETRY_DELAY_MS * attempt * 2); // exponential: 800ms, 1600ms
         return polygonFetch(url, attempt + 1);
       }
       console.error('[chain.js] Polygon 429 after all retries');
@@ -44,7 +56,7 @@ async function polygonFetch(url, attempt = 1) {
   }
 }
 
-async function fetchAllPages(initialUrl, _polygonKey) {
+async function fetchAllPages(initialUrl) {
   const results = [];
   let url = initialUrl;
   let pageCount = 0;
@@ -63,7 +75,7 @@ async function fetchAllPages(initialUrl, _polygonKey) {
     url = data.next_url ?? null;
     pageCount++;
 
-    if (url) await sleep(50);
+    if (url) await sleep(80); // slightly longer pause between pages
   }
 
   if (pageCount >= MAX_PAGES) {
@@ -96,12 +108,17 @@ module.exports = async function handler(req, res) {
     });
   }
 
+  // ─── Spot price helper — fixed for index tickers ─────────────────────────────
   async function fetchSpot(ticker) {
     try {
-      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${polygonKey}`;
+      const aggTicker = toPolygonAggTicker(ticker);
+
+      // 1. Prev-day aggregate — always works, 24/7
+      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${polygonKey}`;
       const prevR = await polygonFetch(prevUrl);
       let prevClose = 0;
       let prevVwap = 0;
+
       if (prevR) {
         const prevData = await prevR.json();
         const bar = prevData?.results?.[0];
@@ -111,20 +128,25 @@ module.exports = async function handler(req, res) {
         }
       }
 
+      // 2. Live last trade
+      // INDEX tickers → /v2/last/trade/I:SPX  (NOT /v2/last/stocks/ — returns 403 on indices)
+      // Equity tickers → /v2/last/stocks/{ticker}
       let livePrice = 0;
       try {
-        const lastUrl = `https://api.polygon.io/v2/last/stocks/${ticker}?apiKey=${polygonKey}`;
+        const lastUrl = isIndexTicker(ticker)
+          ? `https://api.polygon.io/v2/last/trade/${encodeURIComponent(aggTicker)}?apiKey=${polygonKey}`
+          : `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${polygonKey}`;
         const lastR = await polygonFetch(lastUrl);
         if (lastR) {
           const lastData = await lastR.json();
           livePrice = lastData?.results?.p ?? lastData?.last?.price ?? 0;
         }
       } catch {
-        // live price unavailable — use prevClose
+        // live price unavailable — fall through to prevClose
       }
 
       const price = livePrice > 0 ? livePrice : prevClose;
-      console.log(`[chain.js] fetchSpot ${ticker}: livePrice=${livePrice}, prevClose=${prevClose}, using=${price}`);
+      console.log(`[chain.js] fetchSpot ${ticker} (agg=${aggTicker}): live=${livePrice}, prev=${prevClose}, using=${price}`);
       return { price, prevClose, vwap: prevVwap };
     } catch {
       return { price: 0, prevClose: 0, vwap: 0 };
@@ -144,9 +166,9 @@ module.exports = async function handler(req, res) {
   }
 
   function isBlockTrade(contract) {
-    const conditions = contract.day?.conditions ?? contract.last_trade?.conditions ?? [];
+    const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
     if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
-    const lastSize = contract.last_trade?.size ?? 0;
+    const lastSize = contract.market_data?.last_trade?.size ?? 0;
     return lastSize >= 50;
   }
 
@@ -154,11 +176,11 @@ module.exports = async function handler(req, res) {
     let totalVol = 0;
     let weightedIV = 0;
     contracts.forEach(c => {
-      const iv  = side === 'call' ? c.callIV  : c.putIV;
+      const iv = side === 'call' ? c.callIV : c.putIV;
       const vol = side === 'call' ? c.callVolume : c.putVolume;
       if (iv > 0 && vol > 0) {
         weightedIV += iv * vol;
-        totalVol   += vol;
+        totalVol += vol;
       }
     });
     return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
@@ -175,7 +197,7 @@ module.exports = async function handler(req, res) {
     }));
   }
 
-  // ─── MODE 1: Expiry dates only ────────────────────────────────────────────
+  // ─── MODE 1: Expiry dates only ────────────────────────────────────────────────
   if (datesOnly === 'true') {
     try {
       const sortedDates = await fetchExpiryDates(sym);
@@ -186,7 +208,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────
+  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
   if (allExpiries === 'true') {
     try {
       const allDates = await fetchExpiryDates(sym);
@@ -199,62 +221,62 @@ module.exports = async function handler(req, res) {
 
       const { price: spot } = await fetchSpot(sym);
 
-      const expiryGEX = await Promise.allSettled(
-        upcoming.map(async (expDate) => {
-          try {
-            const callsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
-            const putsUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
-            const [calls, puts] = await Promise.all([
-              fetchAllPages(callsUrl, polygonKey),
-              fetchAllPages(putsUrl, polygonKey),
-            ]);
+      // SERIALIZED — not Promise.all — to avoid 429 blast from 8 simultaneous fetches
+      const expiryGEX = [];
+      for (const expDate of upcoming) {
+        try {
+          const callsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
+          const putsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
 
-            const strikeMap = new Map();
-            calls.forEach(c => {
-              const strike = c.details?.strike_price;
-              if (!strike) return;
-              const oi    = c.open_interest ?? 0;
-              const gamma = c.greeks?.gamma ?? 0;
-              if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
-              strikeMap.get(strike).callGEX = oi * gamma * spot * spot * 100;
-            });
-            puts.forEach(p => {
-              const strike = p.details?.strike_price;
-              if (!strike) return;
-              const oi    = p.open_interest ?? 0;
-              const gamma = p.greeks?.gamma ?? 0;
-              if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
-              strikeMap.get(strike).putGEX = oi * gamma * spot * spot * 100;
-            });
+          // Stagger calls and puts with a small gap
+          const calls = await fetchAllPages(callsUrl);
+          await sleep(100);
+          const puts = await fetchAllPages(putsUrl);
+          await sleep(120); // pause between expiry dates
 
-            const strikes = Array.from(strikeMap.values()).map(s => ({
-              strike: s.strike,
-              netGEX: s.callGEX - s.putGEX,
-            }));
+          const strikeMap = new Map();
 
-            const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
-            const dominantWall = strikes.reduce((best, s) =>
-              Math.abs(s.netGEX) > Math.abs(best?.netGEX ?? 0) ? s : best, null);
+          calls.forEach(c => {
+            const strike = c.details?.strike_price;
+            if (!strike) return;
+            const oi = c.open_interest ?? 0;
+            const gamma = c.greeks?.gamma ?? 0;
+            if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
+            strikeMap.get(strike).callGEX = oi * gamma * spot * spot * 100;
+          });
 
-            return { expiry: expDate, strikes, totalNetGEX, dominantWall };
-          } catch {
-            return null;
-          }
-        })
-      );
+          puts.forEach(p => {
+            const strike = p.details?.strike_price;
+            if (!strike) return;
+            const oi = p.open_interest ?? 0;
+            const gamma = p.greeks?.gamma ?? 0;
+            if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
+            strikeMap.get(strike).putGEX = oi * gamma * spot * spot * 100;
+          });
 
-      const results = expiryGEX
-        .filter(r => r.status === 'fulfilled' && r.value !== null)
-        .map(r => r.value);
+          const strikes = Array.from(strikeMap.values()).map(s => ({
+            strike: s.strike,
+            netGEX: s.callGEX - s.putGEX,
+          }));
 
-      return res.status(200).json({ symbol: sym, spot, expiryGEX: results, source: 'polygon-realtime' });
+          const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
+          const dominantWall = strikes.reduce((best, s) =>
+            Math.abs(s.netGEX) > Math.abs(best?.netGEX ?? 0) ? s : best, null);
+
+          expiryGEX.push({ expiry: expDate, strikes, totalNetGEX, dominantWall });
+        } catch {
+          // skip this expiry
+        }
+      }
+
+      return res.status(200).json({ symbol: sym, spot, expiryGEX, source: 'polygon-realtime' });
     } catch (error) {
       console.error('Error fetching multi-expiry GEX:', error);
       return res.status(200).json({ symbol: sym, expiryGEX: [], source: 'polygon-error' });
     }
   }
 
-  // ─── MODE 2: Full options chain ───────────────────────────────────────────
+  // ─── MODE 2: Full options chain ───────────────────────────────────────────────
   if (expiration) {
     try {
       let resolvedExpiration = expiration;
@@ -269,12 +291,12 @@ module.exports = async function handler(req, res) {
       }
 
       const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
-      const putsBaseUrl  = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
+      const putsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
-      const [callsResults, putsResults] = await Promise.all([
-        fetchAllPages(callsBaseUrl, polygonKey),
-        fetchAllPages(putsBaseUrl, polygonKey),
-      ]);
+      // Stagger calls and puts — small gap prevents simultaneous 429
+      const callsResults = await fetchAllPages(callsBaseUrl);
+      await sleep(100);
+      const putsResults = await fetchAllPages(putsBaseUrl);
 
       console.log(`[chain.js] ${sym} ${resolvedExpiration}: ${callsResults.length} calls, ${putsResults.length} puts fetched`);
 
@@ -294,12 +316,16 @@ module.exports = async function handler(req, res) {
       let spot = 0;
       let spotPrevClose = 0;
       let spotVwap = 0;
+
+      // Try to extract spot from the underlying_asset field of the snapshot response
       const ua = callsResults[0]?.underlying_asset ?? putsResults[0]?.underlying_asset ?? null;
       if (ua && ua.price > 0) {
         spot = ua.price;
         spotPrevClose = ua.day?.prev_close ?? ua.day?.c ?? 0;
         spotVwap = ua.day?.vw ?? 0;
       }
+
+      // If not available from snapshot, fetch directly (with index-aware endpoint)
       if (spot <= 0) {
         const fallback = await fetchSpot(sym);
         spot = fallback.price;
@@ -312,6 +338,7 @@ module.exports = async function handler(req, res) {
         : 0;
 
       const contractMap = new Map();
+
       function ensureStrike(strike) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
@@ -336,9 +363,11 @@ module.exports = async function handler(req, res) {
         const strike = c.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
+
         const bid = c.last_quote?.bid ?? 0;
         const ask = c.last_quote?.ask ?? 0;
         const lastTradePrice = c.last_trade?.price ?? c.last_quote?.midpoint ?? 0;
+
         entry.callBid = bid;
         entry.callAsk = ask;
         entry.callLast = lastTradePrice;
@@ -350,7 +379,7 @@ module.exports = async function handler(req, res) {
         entry.callDelta = c.greeks?.delta ?? null;
         entry.callTheta = c.greeks?.theta ?? null;
         entry.callGamma = c.greeks?.gamma ?? null;
-        entry.callVega  = c.greeks?.vega  ?? null;
+        entry.callVega = c.greeks?.vega ?? null;
         entry.callVanna = c.greeks?.vanna ?? null;
         entry.callCharm = c.greeks?.charm ?? null;
         entry.callDayVol = c.day?.volume ?? 0;
@@ -366,9 +395,11 @@ module.exports = async function handler(req, res) {
         const strike = p.details?.strike_price;
         if (!strike) return;
         const entry = ensureStrike(strike);
+
         const bid = p.last_quote?.bid ?? 0;
         const ask = p.last_quote?.ask ?? 0;
         const lastTradePrice = p.last_trade?.price ?? p.last_quote?.midpoint ?? 0;
+
         entry.putBid = bid;
         entry.putAsk = ask;
         entry.putLast = lastTradePrice;
@@ -380,7 +411,7 @@ module.exports = async function handler(req, res) {
         entry.putDelta = p.greeks?.delta ?? null;
         entry.putTheta = p.greeks?.theta ?? null;
         entry.putGamma = p.greeks?.gamma ?? null;
-        entry.putVega  = p.greeks?.vega  ?? null;
+        entry.putVega = p.greeks?.vega ?? null;
         entry.putVanna = p.greeks?.vanna ?? null;
         entry.putCharm = p.greeks?.charm ?? null;
         entry.putDayVol = p.day?.volume ?? 0;
@@ -404,7 +435,7 @@ module.exports = async function handler(req, res) {
           ...c,
           atm: spot > 0 && Math.abs(c.strike - spot) < Math.max(strikeStep * 0.6, 1),
           itmCall: spot > 0 ? c.strike < spot : false,
-          itmPut:  spot > 0 ? c.strike > spot : false,
+          itmPut: spot > 0 ? c.strike > spot : false,
         }));
 
       let impliedMove = null;
@@ -424,19 +455,20 @@ module.exports = async function handler(req, res) {
       }
 
       const vwivCall = computeVWIV(contracts, 'call');
-      const vwivPut  = computeVWIV(contracts, 'put');
+      const vwivPut = computeVWIV(contracts, 'put');
       const callOIWalls = findOIWalls(contracts, 'call');
-      const putOIWalls  = findOIWalls(contracts, 'put');
+      const putOIWalls = findOIWalls(contracts, 'put');
       const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
-      const blockPutCount  = contracts.filter(c => c.putBlockTrade).length;
-
+      const blockPutCount = contracts.filter(c => c.putBlockTrade).length;
       const gammaCount = contracts.filter(c => c.callGamma !== null || c.putGamma !== null).length;
+
       const sampleContracts = contracts.slice(0, 3).map(c => ({
         strike: c.strike,
         callBid: c.callBid, callAsk: c.callAsk, callLast: c.callLast,
         putBid: c.putBid, putAsk: c.putAsk, putLast: c.putLast,
         callGamma: c.callGamma, callDelta: c.callDelta,
       }));
+
       console.log(`[chain.js] Gamma: ${gammaCount}/${contracts.length} contracts have gamma`);
       console.log(`[chain.js] Spot: ${spot} (prevClose: ${spotPrevClose}, change: ${spotChangePct.toFixed(2)}%)`);
       console.log('[chain.js] Sample:', JSON.stringify(sampleContracts, null, 2));
@@ -467,7 +499,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── No mode specified ────────────────────────────────────────────────────
+  // ─── No mode specified ────────────────────────────────────────────────────────
   return res.status(400).json({
     error: 'Either datesOnly=true, expiration, or allExpiries=true required',
     usage: 'GET /api/chain?symbol=TSLA&datesOnly=true  OR  /api/chain?symbol=TSLA&expiration=2026-06-20  OR  /api/chain?symbol=TSLA&allExpiries=true',
