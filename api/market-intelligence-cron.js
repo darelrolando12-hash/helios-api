@@ -1,0 +1,329 @@
+const POLYGON_KEY  = process.env.POLYGON_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+const CRON_SECRET  = process.env.CRON_SECRET ?? 'helios-cron';
+
+const MARKET_TICKERS   = ['SPY', 'QQQ', 'IWM'];
+const INDEX_TICKER_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', VIX: 'I:VIX', SPXW: 'I:SPX' };
+
+const MIN_MOVE_PCT     = 0.4;
+const STRONG_MOVE_PCT  = 0.75;
+const COOLDOWN_MS      = 45 * 60 * 1000;
+const ENTRY_WINDOW_MIN = 90;
+
+// ─── CT time helpers ──────────────────────────────────────────────────────────
+
+function getCTNow() {
+  const ct = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+  return {
+    h:        ct.getHours(),
+    m:        ct.getMinutes(),
+    totalMin: ct.getHours() * 60 + ct.getMinutes(),
+    dateStr:  ct.toLocaleDateString('en-CA'),
+    isoStr:   new Date().toISOString(),
+  };
+}
+
+function isWeekend() {
+  const ct = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+  return ct.getDay() === 0 || ct.getDay() === 6;
+}
+
+function isMarketHours(totalMin) {
+  return totalMin >= 8 * 60 && totalMin <= 15 * 60 + 5;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function toPolygonAggTicker(ticker) {
+  if (ticker.startsWith('^')) return ticker.replace('^', 'I:');
+  return INDEX_TICKER_MAP[ticker] ?? ticker;
+}
+
+function computeSignalStatus(detectedAtIso, closesAtIso) {
+  const msLeft = new Date(closesAtIso).getTime() - Date.now();
+  if (msLeft <= 0)             return 'expired';
+  if (msLeft < 5 * 60 * 1000) return 'fading';
+  return 'active';
+}
+
+// ─── Polygon fetch ────────────────────────────────────────────────────────────
+
+async function polyFetch(url, attempt = 1) {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Helios-MarketIntel/1.0' },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (res.status === 429) {
+      if (attempt >= 3) return null;
+      await sleep(600 * attempt);
+      return polyFetch(url, attempt + 1);
+    }
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Fetch live quote for a ticker ───────────────────────────────────────────
+
+async function fetchLiveQuote(ticker) {
+  const aggTicker = toPolygonAggTicker(ticker);
+  const isIndex   = !!(INDEX_TICKER_MAP[ticker] || ticker.startsWith('^'));
+
+  const prevUrl  = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
+  const prevData = await polyFetch(prevUrl);
+  const prevBar  = prevData?.results?.[0];
+  const prevClose = prevBar?.c ?? 0;
+
+  let price = 0;
+  try {
+    const lastUrl  = isIndex
+      ? `https://api.polygon.io/v2/last/trade/${encodeURIComponent(aggTicker)}?apiKey=${POLYGON_KEY}`
+      : `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+    const lastData = await polyFetch(lastUrl);
+    price = lastData?.results?.p ?? lastData?.last?.price ?? 0;
+  } catch { /* use prevClose */ }
+
+  if (price === 0) price = prevClose;
+  if (price === 0 || prevClose === 0) return null;
+
+  return {
+    ticker,
+    price,
+    prevClose,
+    changePct: ((price - prevClose) / prevClose) * 100,
+  };
+}
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+
+async function dbRead(table, filterStr) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${filterStr}`;
+  const res = await fetch(url, {
+    headers: {
+      'apikey':        SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    },
+  });
+  if (!res.ok) return [];
+  return res.json();
+}
+
+async function dbUpsert(table, row) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}`;
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'apikey':        SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Prefer':        'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify(row),
+  });
+  return res.ok;
+}
+
+async function dbDeleteOld(table, field, olderThanIso) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${field}=lt.${olderThanIso}`;
+  await fetch(url, {
+    method:  'DELETE',
+    headers: {
+      'apikey':        SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    },
+  });
+}
+
+// ─── Cooldown management (DB-backed) ─────────────────────────────────────────
+
+async function isCoolingDown(cooldownKey) {
+  try {
+    const rows = await dbRead('market_signal_cooldowns', `cooldown_key=eq.${cooldownKey}`);
+    if (!rows.length) return false;
+    return (Date.now() - new Date(rows[0].fired_at).getTime()) < COOLDOWN_MS;
+  } catch {
+    return false;
+  }
+}
+
+async function markCooldown(cooldownKey) {
+  await dbUpsert('market_signal_cooldowns', {
+    cooldown_key: cooldownKey,
+    fired_at:     new Date().toISOString(),
+  });
+}
+
+// ─── Refresh status of existing signals ──────────────────────────────────────
+
+async function refreshSignalStatuses() {
+  try {
+    const rows = await dbRead('market_signals', 'status=in.(active,fading)');
+    if (!rows.length) return;
+
+    for (const row of rows) {
+      const newStatus = computeSignalStatus(row.detected_at, row.entry_window_closes_at);
+      if (newStatus !== row.status) {
+        await dbUpsert('market_signals', { ...row, status: newStatus });
+        console.log(`[market-intel] ${row.ticker} ${row.direction} → ${row.status} → ${newStatus}`);
+      }
+    }
+  } catch (e) {
+    console.error('[market-intel] Status refresh error:', e.message);
+  }
+}
+
+// ─── Cleanup stale signals ────────────────────────────────────────────────────
+
+async function cleanupOldSignals() {
+  const cutoff         = new Date(Date.now() - 4  * 60 * 60 * 1000).toISOString();
+  const cooldownCutoff = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  await dbDeleteOld('market_signals',           'detected_at', cutoff);
+  await dbDeleteOld('market_signal_cooldowns',  'fired_at',    cooldownCutoff);
+}
+
+// ─── RIP/DUMP detection ───────────────────────────────────────────────────────
+
+async function detectMarketOpenPlay(quotes, ct) {
+  const { totalMin, isoStr, dateStr } = ct;
+
+  // Tier 1: 8:30 AM – 10:00 AM CT only
+  if (totalMin < 8 * 60 + 30 || totalMin > 10 * 60) return null;
+
+  const spy = quotes.find(q => q.ticker === 'SPY');
+  const qqq = quotes.find(q => q.ticker === 'QQQ');
+  const iwm = quotes.find(q => q.ticker === 'IWM');
+  if (!spy || !qqq || !iwm) return null;
+
+  const moves = [
+    { ticker: 'SPY', pct: spy.changePct },
+    { ticker: 'QQQ', pct: qqq.changePct },
+    { ticker: 'IWM', pct: iwm.changePct },
+  ];
+
+  const bullish    = moves.filter(m => m.pct >=  MIN_MOVE_PCT);
+  const bearish    = moves.filter(m => m.pct <= -MIN_MOVE_PCT);
+  const strongBull = moves.filter(m => m.pct >=  STRONG_MOVE_PCT);
+  const strongBear = moves.filter(m => m.pct <= -STRONG_MOVE_PCT);
+
+  let direction = null, confirmers = [], movePct = 0, conviction = 0;
+
+  if (bullish.length >= 2 || strongBull.length >= 1) {
+    direction  = 'rip';
+    confirmers = bullish.map(m => m.ticker);
+    movePct    = Math.max(...moves.map(m => m.pct));
+    conviction = Math.min(95, 55 + Math.round(movePct * 10) + (strongBull.length >= 2 ? 10 : 0));
+  } else if (bearish.length >= 2 || strongBear.length >= 1) {
+    direction  = 'dump';
+    confirmers = bearish.map(m => m.ticker);
+    movePct    = Math.abs(Math.min(...moves.map(m => m.pct)));
+    conviction = Math.min(95, 55 + Math.round(movePct * 10) + (strongBear.length >= 2 ? 10 : 0));
+  }
+
+  if (!direction) return null;
+
+  const cooldownKey = `${direction}_market_open`;
+  if (await isCoolingDown(cooldownKey)) {
+    console.log(`[market-intel] ${direction.toUpperCase()} on cooldown — skipping`);
+    return null;
+  }
+
+  const entryWindowCloses = new Date(Date.now() + ENTRY_WINDOW_MIN * 60 * 1000).toISOString();
+
+  const signal = {
+    direction,
+    tier:                   'market_open',
+    ticker:                 'SPY',
+    conviction,
+    move_pct:               parseFloat(movePct.toFixed(2)),
+    confirming_tickers:     confirmers,
+    detected_at:            isoStr,       // SERVER UTC — single source of truth
+    detected_date:          dateStr,
+    entry_window_closes_at: entryWindowCloses,
+    status:                 'active',
+    reason:                 `${direction === 'rip' ? 'Market RIP' : 'Market DUMP'}: ${confirmers.join('+')} aligned ${direction === 'rip' ? '+' : '-'}${movePct.toFixed(1)}%`,
+    hold_window_minutes:    15,
+    cooldown_key:           cooldownKey,
+    source:                 'server-cron',
+  };
+
+  await markCooldown(cooldownKey);
+  return signal;
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const isVercelCron = req.headers['x-vercel-cron'] === '1';
+  const secret       = req.query.secret ?? req.headers['x-cron-secret'];
+  if (!isVercelCron && secret !== CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (isWeekend()) {
+    return res.status(200).json({ skipped: true, reason: 'Weekend' });
+  }
+  if (!POLYGON_KEY) {
+    return res.status(500).json({ error: 'POLYGON_API_KEY not configured' });
+  }
+
+  const ct = getCTNow();
+
+  if (!isMarketHours(ct.totalMin)) {
+    await cleanupOldSignals();
+    return res.status(200).json({
+      skipped: true,
+      reason:  `Outside market hours (CT: ${ct.h}:${String(ct.m).padStart(2, '0')})`,
+    });
+  }
+
+  console.log(`[market-intel] Running — CT: ${ct.h}:${String(ct.m).padStart(2, '0')}`);
+
+  // Step 1: Refresh existing signal statuses (active → fading → expired)
+  await refreshSignalStatuses();
+
+  // Step 2: Fetch live quotes (serial, 200ms gaps — no blast)
+  const quotes = [];
+  for (const ticker of MARKET_TICKERS) {
+    const q = await fetchLiveQuote(ticker);
+    if (q) quotes.push(q);
+    await sleep(200);
+  }
+
+  if (quotes.length < 2) {
+    return res.status(200).json({
+      ok: true, quotes: quotes.length,
+      signalFired: false, reason: 'Insufficient data',
+    });
+  }
+
+  // Step 3: Detect RIP/DUMP
+  let signalFired = false;
+  const signal    = await detectMarketOpenPlay(quotes, ct);
+
+  if (signal) {
+    const ok  = await dbUpsert('market_signals', signal);
+    signalFired = ok;
+    console.log(`[market-intel] 🚨 ${signal.direction.toUpperCase()} — ${signal.reason} — conviction=${signal.conviction}`);
+  }
+
+  // Step 4: Cleanup
+  await cleanupOldSignals();
+
+  return res.status(200).json({
+    ok:          true,
+    ct_time:     `${ct.h}:${String(ct.m).padStart(2, '0')} CT`,
+    quotes:      quotes.map(q => ({ ticker: q.ticker, changePct: q.changePct.toFixed(2) })),
+    signalFired,
+    signal:      signal ? { direction: signal.direction, conviction: signal.conviction, reason: signal.reason } : null,
+  });
+}
