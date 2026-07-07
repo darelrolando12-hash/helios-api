@@ -85,28 +85,56 @@ async function fetchYahooQuote(ticker) {
 }
 
 // ── Polygon spot price (stocks + non-VIX indices) ────────────────────────────
-
+//
+// RATE LIMIT ARCHITECTURE — permanent fix:
+//   BEFORE: 2 Polygon calls per quote (prev-day agg + live last-trade) = 156 calls/min for 13 tickers
+//   AFTER:  1 Polygon call per quote (live last-trade only) = 78 calls/min
+//           Prev-day fields (prevClose, PDH, PDL, VWAP, vol) come from DB (daily-data-cron writes them).
+//           /v2/aggs/prev Polygon call only fires if DB has no prev data (first-run / stale DB).
+//
 async function fetchPolygonSpot(ticker) {
   const aggTicker = toPolygonAggTicker(ticker);
+  const sym       = ticker.toUpperCase();
 
-  // 1. Prev-day agg — always works on Options Advanced, 24/7, gives PDH/PDL/VWAP/Vol
-  const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
-  const prevR = await fetch(prevUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
+  // ── Step 1: Read prev-day fields from DB (daily-data-cron writes these at 4:05 PM CT)
+  // Zero Polygon calls for prev-day data when DB is warm.
   let prevClose = 0, prevVwap = 0, prevHigh = 0, prevLow = 0, prevOpen = 0, prevVol = 0;
-  if (prevR.ok) {
-    const d = await prevR.json();
-    const bar = d?.results?.[0];
-    if (bar) {
-      prevClose = bar.c ?? 0;
-      prevVwap  = bar.vw ?? 0;
-      prevHigh  = bar.h ?? 0;
-      prevLow   = bar.l ?? 0;
-      prevOpen  = bar.o ?? 0;
-      prevVol   = bar.v ?? 0;
-    }
+  let prevFromDB = false;
+
+  const dbRow = await readDBDailyData(sym);
+  if (dbRow && dbRow.prev_close) {
+    prevClose  = dbRow.prev_close  ?? 0;
+    prevHigh   = dbRow.prev_high   ?? 0;
+    prevLow    = dbRow.prev_low    ?? 0;
+    prevOpen   = dbRow.prev_open   ?? 0;
+    prevVwap   = dbRow.prev_vwap   ?? 0;
+    prevVol    = dbRow.prev_volume ?? 0;
+    prevFromDB = true;
+    console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from DB (${dbRow.computed_date}), prevClose=${prevClose}`);
   }
 
-  // 2. Live last trade — correct endpoint per ticker type
+  // ── Step 2: If DB miss, fall back to /v2/aggs/prev (one-time cost until cron runs)
+  if (!prevFromDB) {
+    try {
+      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
+      const prevR = await fetch(prevUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
+      if (prevR.ok) {
+        const d = await prevR.json();
+        const bar = d?.results?.[0];
+        if (bar) {
+          prevClose = bar.c ?? 0;
+          prevVwap  = bar.vw ?? 0;
+          prevHigh  = bar.h ?? 0;
+          prevLow   = bar.l ?? 0;
+          prevOpen  = bar.o ?? 0;
+          prevVol   = bar.v ?? 0;
+          console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from Polygon (DB miss), prevClose=${prevClose}`);
+        }
+      }
+    } catch { /* non-blocking */ }
+  }
+
+  // ── Step 3: Live last trade — ALWAYS 1 call (cannot be cached — this is real-time price)
   let livePrice = 0, liveTime = null, liveSize = null;
   try {
     const isIndex = !!INDEX_TICKER_MAP[ticker.toUpperCase()];
@@ -123,7 +151,7 @@ async function fetchPolygonSpot(ticker) {
   } catch { /* non-blocking */ }
 
   const price = livePrice > 0 ? livePrice : prevClose;
-  console.log(`[quote.js] fetchPolygonSpot ${ticker} (agg=${aggTicker}): live=${livePrice}, prev=${prevClose}, using=${price}`);
+  console.log(`[quote.js] fetchPolygonSpot ${ticker}: live=${livePrice}, prevClose=${prevClose}, using=${price}, prevSrc=${prevFromDB ? 'db' : 'polygon'}`);
 
   return { price, prevClose, vwap: prevVwap, high: prevHigh, low: prevLow, open: prevOpen, volume: prevVol, liveTime, liveSize };
 }
