@@ -3,16 +3,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
 const CRON_SECRET  = process.env.CRON_SECRET ?? 'helios-cron';
 
-// Tickers needed for market-wide RIP/DUMP detection
 const MARKET_TICKERS = ['SPY', 'QQQ', 'IWM'];
 const INDEX_TICKER_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', VIX: 'I:VIX', SPXW: 'I:SPX' };
 
-// Detection thresholds — mirrors openPlayDetector.ts
 const MIN_MOVE_PCT    = 0.4;
 const STRONG_MOVE_PCT = 0.75;
-const VOLUME_MULT     = 1.2;
-const COOLDOWN_MS     = 45 * 60 * 1000; // 45 min between same-direction signals
-const ENTRY_WINDOW_MIN = 90; // minutes entry window stays open after detection
+const COOLDOWN_MS     = 45 * 60 * 1000;
+const ENTRY_WINDOW_MIN = 90;
 
 // ─── CT time helpers ──────────────────────────────────────────────────────────
 
@@ -23,7 +20,7 @@ function getCTNow() {
     m:        ct.getMinutes(),
     totalMin: ct.getHours() * 60 + ct.getMinutes(),
     dateStr:  ct.toLocaleDateString('en-CA'),
-    isoStr:   new Date().toISOString(), // always UTC for DB storage
+    isoStr:   new Date().toISOString(),
   };
 }
 
@@ -33,7 +30,6 @@ function isWeekend() {
 }
 
 function isMarketHours(totalMin) {
-  // 8:00 AM CT pre-check through 3:05 PM CT close
   return totalMin >= 8 * 60 && totalMin <= 15 * 60 + 5;
 }
 
@@ -89,7 +85,6 @@ async function getDBPrevClose(symbol) {
     const rows = await r.json();
     if (!Array.isArray(rows) || rows.length === 0) return null;
     const row = rows[0];
-    // Accept up to 7 days old — prev-day bar is valid all week
     const rowDate = new Date(row.date + 'T00:00:00');
     const ageMs = Date.now() - rowDate.getTime();
     if (ageMs > 7 * 24 * 60 * 60 * 1000) return null;
@@ -190,14 +185,14 @@ async function dbDeleteOld(table, field, olderThanIso) {
 
 // ─── Cooldown management (DB-backed, not localStorage) ───────────────────────
 
-async function isCoolingDown(cooldownKey, ct) {
+async function isCoolingDown(cooldownKey) {
   try {
     const rows = await dbRead('market_signal_cooldowns', { cooldown_key: `eq.${cooldownKey}` });
     if (!rows.length) return false;
     const lastFiredAt = new Date(rows[0].fired_at).getTime();
     return (Date.now() - lastFiredAt) < COOLDOWN_MS;
   } catch {
-    return false; // fail open — better to show than suppress
+    return false;
   }
 }
 
@@ -208,20 +203,18 @@ async function markCooldown(cooldownKey) {
   });
 }
 
-// ─── Signal status computation (server-side) ─────────────────────────────────
-// This is the authoritative status. Devices read this — they never compute it themselves.
+// ─── Signal status computation ────────────────────────────────────────────────
 
 function computeSignalStatus(detectedAtIso, entryWindowClosesAtIso) {
   const now      = Date.now();
   const closesAt = new Date(entryWindowClosesAtIso).getTime();
   const msLeft   = closesAt - now;
-
   if (msLeft <= 0)              return 'expired';
-  if (msLeft < 5 * 60 * 1000)  return 'fading';  // < 5 min left
+  if (msLeft < 5 * 60 * 1000)  return 'fading';
   return 'active';
 }
 
-// ─── RIP/DUMP detection — mirrors openPlayDetector.ts Tier 1 ─────────────────
+// ─── RIP/DUMP detection ───────────────────────────────────────────────────────
 
 async function detectMarketOpenPlay(quotes, ct) {
   const { totalMin, isoStr, dateStr } = ct;
@@ -234,22 +227,21 @@ async function detectMarketOpenPlay(quotes, ct) {
   const iwm = quotes.find(q => q.ticker === 'IWM');
   if (!spy || !qqq || !iwm) return null;
 
-  // Determine direction and confirming tickers
   const moves = [
     { ticker: 'SPY', pct: spy.changePct },
     { ticker: 'QQQ', pct: qqq.changePct },
     { ticker: 'IWM', pct: iwm.changePct },
   ];
 
-  const bullish   = moves.filter(m => m.pct >= MIN_MOVE_PCT);
-  const bearish   = moves.filter(m => m.pct <= -MIN_MOVE_PCT);
+  const bullish    = moves.filter(m => m.pct >= MIN_MOVE_PCT);
+  const bearish    = moves.filter(m => m.pct <= -MIN_MOVE_PCT);
   const strongBull = moves.filter(m => m.pct >= STRONG_MOVE_PCT);
   const strongBear = moves.filter(m => m.pct <= -STRONG_MOVE_PCT);
 
-  let direction    = null;
-  let confirmers   = [];
-  let movePct      = 0;
-  let conviction   = 0;
+  let direction  = null;
+  let confirmers = [];
+  let movePct    = 0;
+  let conviction = 0;
 
   if (bullish.length >= 2 || strongBull.length >= 1) {
     direction  = 'rip';
@@ -266,12 +258,11 @@ async function detectMarketOpenPlay(quotes, ct) {
   if (!direction) return null;
 
   const cooldownKey = `${direction}_market_open`;
-  if (await isCoolingDown(cooldownKey, ct)) {
+  if (await isCoolingDown(cooldownKey)) {
     console.log(`[market-intel] ${direction.toUpperCase()} cooled down — skipping`);
     return null;
   }
 
-  // Build the signal
   const entryWindowCloses = new Date(Date.now() + ENTRY_WINDOW_MIN * 60 * 1000).toISOString();
   const signal = {
     direction,
@@ -280,11 +271,11 @@ async function detectMarketOpenPlay(quotes, ct) {
     conviction,
     move_pct:      parseFloat(movePct.toFixed(2)),
     confirming_tickers: confirmers,
-    detected_at:   isoStr, // SERVER UTC — authoritative timestamp
+    detected_at:   isoStr,
     detected_date: dateStr,
     entry_window_closes_at: entryWindowCloses,
     status:        'active',
-    reason:        `${direction === 'rip' ? 'Market RIP' : 'Market DUMP'}: ${confirmers.join('+') } aligned ${direction === 'rip' ? '+' : '-'}${movePct.toFixed(1)}%`,
+    reason:        `${direction === 'rip' ? 'Market RIP' : 'Market DUMP'}: ${confirmers.join('+')} aligned ${direction === 'rip' ? '+' : '-'}${movePct.toFixed(1)}%`,
     hold_window_minutes: 15,
     cooldown_key:  cooldownKey,
     source:        'server-cron',
@@ -294,22 +285,17 @@ async function detectMarketOpenPlay(quotes, ct) {
   return signal;
 }
 
-// ─── Update status of existing signals (aging + expiry) ──────────────────────
+// ─── Update status of existing signals ───────────────────────────────────────
 
 async function refreshSignalStatuses() {
   try {
-    // Read all active/fading signals from today
-    const rows = await dbRead('market_signals', {
-      'status': 'in.(active,fading)',
-    });
-
+    const rows = await dbRead('market_signals', { 'status': 'in.(active,fading)' });
     if (!rows.length) return;
-
     for (const row of rows) {
       const newStatus = computeSignalStatus(row.detected_at, row.entry_window_closes_at);
       if (newStatus !== row.status) {
         await dbUpsert('market_signals', { ...row, status: newStatus });
-        console.log(`[market-intel] ${row.ticker} ${row.direction} → status updated: ${row.status} → ${newStatus}`);
+        console.log(`[market-intel] ${row.ticker} ${row.direction} → status: ${row.status} → ${newStatus}`);
       }
     }
   } catch (e) {
@@ -317,19 +303,18 @@ async function refreshSignalStatuses() {
   }
 }
 
-// ─── Clean up stale signals (> 4 hours old) ───────────────────────────────────
+// ─── Clean up stale signals ───────────────────────────────────────────────────
 
 async function cleanupOldSignals() {
   const cutoff = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
   await dbDeleteOld('market_signals', 'detected_at', cutoff);
-  // Also clear stale cooldowns (> 12 hours)
   const cooldownCutoff = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   await dbDeleteOld('market_signal_cooldowns', 'fired_at', cooldownCutoff);
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -343,30 +328,31 @@ export default async function handler(req, res) {
   if (isWeekend()) {
     return res.status(200).json({ skipped: true, reason: 'Weekend' });
   }
+
   if (!POLYGON_KEY) {
-    return res.status(500).json({ error: 'POLYGON_API_KEY not configured' });
+    return res.status(200).json({ skipped: true, reason: 'No POLYGON_API_KEY' });
+  }
+
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    return res.status(200).json({ skipped: true, reason: 'No DB credentials' });
   }
 
   const ct = getCTNow();
 
-  // Only run during market hours
   if (!isMarketHours(ct.totalMin)) {
-    // Still run cleanup and status refresh even outside hours
     await cleanupOldSignals();
     return res.status(200).json({ skipped: true, reason: `Outside market hours (CT: ${ct.h}:${String(ct.m).padStart(2,'0')})` });
   }
 
   console.log(`[market-intel] Running — CT: ${ct.h}:${String(ct.m).padStart(2,'0')}`);
 
-  // Step 1: Refresh status of existing signals (aging/expiry)
   await refreshSignalStatuses();
 
-  // Step 2: Fetch live quotes for market tickers (serial — no blast)
   const quotes = [];
   for (const ticker of MARKET_TICKERS) {
     const q = await fetchLiveQuote(ticker);
     if (q) quotes.push(q);
-    await sleep(200); // 200ms gap between quote fetches
+    await sleep(200);
   }
 
   if (quotes.length < 2) {
@@ -374,17 +360,15 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, quotes: quotes.length, signalFired: false, reason: 'Insufficient data' });
   }
 
-  // Step 3: Run RIP/DUMP detection
   let signalFired = false;
   const signal = await detectMarketOpenPlay(quotes, ct);
 
   if (signal) {
     const ok = await dbUpsert('market_signals', signal);
     signalFired = ok;
-    console.log(`[market-intel] 🚨 ${signal.direction.toUpperCase()} detected — ${signal.reason} — conviction=${signal.conviction} — DB write: ${ok ? 'ok' : 'failed'}`);
+    console.log(`[market-intel] ${signal.direction.toUpperCase()} detected — ${signal.reason} — conviction=${signal.conviction} — DB write: ${ok ? 'ok' : 'failed'}`);
   }
 
-  // Step 4: Cleanup old signals every cycle
   await cleanupOldSignals();
 
   return res.status(200).json({
@@ -394,4 +378,4 @@ export default async function handler(req, res) {
     signalFired,
     signal:       signal ? { direction: signal.direction, conviction: signal.conviction, reason: signal.reason } : null,
   });
-}
+};
