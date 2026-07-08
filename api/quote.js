@@ -33,10 +33,12 @@ async function readDBDailyData(symbol) {
     const rows = await r.json();
     if (!Array.isArray(rows) || rows.length === 0) return null;
     const row = rows[0];
-    // Reject if data is older than 3 days (stale DB)
+    // Reject if data is older than 7 days (truly stale — prev-day bar is valid all week)
+    // NOTE: Before 4PM CT daily cron runs, DB has yesterday's data — that's perfectly valid.
+    // Old 3-day threshold was causing false misses Mon morning after a cron delay.
     const rowDate = new Date(row.date + 'T00:00:00');
     const ageMs = Date.now() - rowDate.getTime();
-    if (ageMs > 3 * 24 * 60 * 60 * 1000) {
+    if (ageMs > 7 * 24 * 60 * 60 * 1000) {
       console.warn(`[quote.js] DB daily_market_data stale for ${symbol} (${row.date}) — falling back to Polygon`);
       return null;
     }
@@ -122,31 +124,36 @@ async function fetchPolygonSpot(ticker) {
         const d = await prevR.json();
         const bar = d?.results?.[0];
         if (bar) {
-          prevClose = bar.c ?? 0;
+          prevClose = bar.c  ?? 0;
+          prevHigh  = bar.h  ?? 0;
+          prevLow   = bar.l  ?? 0;
+          prevOpen  = bar.o  ?? 0;
           prevVwap  = bar.vw ?? 0;
-          prevHigh  = bar.h ?? 0;
-          prevLow   = bar.l ?? 0;
-          prevOpen  = bar.o ?? 0;
-          prevVol   = bar.v ?? 0;
-          console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from Polygon (DB miss), prevClose=${prevClose}`);
+          prevVol   = bar.v  ?? 0;
+          console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from Polygon /prev (DB miss), prevClose=${prevClose}`);
         }
       }
     } catch { /* non-blocking */ }
   }
 
-  // ── Step 3: Live last trade — ALWAYS 1 call (cannot be cached — this is real-time price)
-  let livePrice = 0, liveTime = null, liveSize = null;
+  // ── Step 3: Live last-trade price (1 Polygon call always)
+  let livePrice = 0;
+  let liveTime  = null;
+  let liveSize  = null;
+
   try {
-    const isIndex = !!INDEX_TICKER_MAP[ticker.toUpperCase()];
+    const isIndex = !!INDEX_TICKER_MAP[sym] || sym.startsWith('I:');
     const lastUrl = isIndex
       ? `https://api.polygon.io/v2/last/trade/${encodeURIComponent(aggTicker)}?apiKey=${POLYGON_KEY}`
-      : `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+      : `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(sym)}?apiKey=${POLYGON_KEY}`;
     const lastR = await fetch(lastUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
     if (lastR.ok) {
-      const ld = await lastR.json();
-      livePrice = ld?.results?.p ?? ld?.last?.price ?? 0;
-      liveTime  = ld?.results?.t ?? ld?.last?.timestamp ?? null;
-      liveSize  = ld?.results?.s ?? ld?.last?.size      ?? null;
+      const d = await lastR.json();
+      // /v2/last/trade returns { results: { p, t, s } }
+      // /v2/last/stocks returns { last: { price, timestamp, size } }
+      livePrice = d?.results?.p ?? d?.last?.price ?? 0;
+      liveTime  = d?.results?.t ?? d?.last?.timestamp ?? null;
+      liveSize  = d?.results?.s ?? d?.last?.size ?? null;
     }
   } catch { /* non-blocking */ }
 
@@ -409,63 +416,54 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ── Type: validate_contract (Yahoo Finance existence check) ─────────────────
+  // ── Type: validate_contract ──────────────────────────────────────────────────
   if (type === 'validate_contract') {
+    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, valid: false, error: 'No Polygon key' });
     const { expiry, strike, optionType } = req.query;
     if (!expiry || !strike || !optionType) {
-      return res.status(400).json({ error: 'expiry, strike, optionType required' });
+      return res.status(200).json({ valid: false, error: 'expiry, strike, optionType required' });
     }
     try {
-      const expiryDate  = new Date(expiry + 'T12:00:00Z');
-      const expiryUnix  = Math.floor(expiryDate.getTime() / 1000);
-      const yahooChain  = await fetch(
-        `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(sym)}?date=${expiryUnix}`,
-        { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)', Accept: 'application/json' } }
-      );
-      if (!yahooChain.ok) return res.status(200).json({ exists: false, source: 'yahoo-delayed' });
-      const chainData = await yahooChain.json();
-      const chain = chainData?.optionChain?.result?.[0];
-      if (!chain) return res.status(200).json({ exists: false, source: 'yahoo-delayed' });
-      const targetStrike  = parseFloat(strike);
-      const contracts     = optionType === 'call'
-        ? (chain.options?.[0]?.calls ?? [])
-        : (chain.options?.[0]?.puts  ?? []);
-      const match = contracts.find(c => Math.abs(c.strike - targetStrike) < 0.01);
+      const url = `https://api.polygon.io/v3/snapshot/options/${encodeURIComponent(sym)}?expiration_date=${expiry}&strike_price=${strike}&contract_type=${optionType}&limit=1&apiKey=${POLYGON_KEY}`;
+      const r = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
+      if (!r.ok) return res.status(200).json({ valid: false, error: `Polygon ${r.status}` });
+      const data = await r.json();
+      const exists = Array.isArray(data.results) && data.results.length > 0;
+      const contract = data.results?.[0];
       return res.status(200).json({
-        exists:   !!match,
-        strike:   match?.strike ?? targetStrike,
-        expiry,
-        optionType,
-        bid:               match?.bid              ?? null,
-        ask:               match?.ask              ?? null,
-        lastPrice:         match?.lastPrice        ?? null,
-        openInterest:      match?.openInterest     ?? null,
-        impliedVolatility: match?.impliedVolatility ?? null,
-        source: 'yahoo-delayed',
+        valid:  exists,
+        bid:    contract?.last_quote?.bid   ?? null,
+        ask:    contract?.last_quote?.ask   ?? null,
+        last:   contract?.last_trade?.price ?? null,
+        iv:     contract?.implied_volatility ?? contract?.greeks?.implied_volatility ?? null,
+        delta:  contract?.greeks?.delta ?? null,
+        source: 'polygon-realtime',
       });
     } catch (e) {
-      return res.status(200).json({ exists: false, error: e.message, source: 'yahoo-validate-failed' });
+      return res.status(200).json({ valid: false, error: e.message });
     }
   }
 
-  // ── Main quote — RULE 1 VIX path already handled above ──────────────────────
-  // For all other tickers: Polygon primary, Yahoo fallback
+  // ── Default: main quote (real-time price) ────────────────────────────────────
   if (!POLYGON_KEY) {
     try {
       const q = await fetchYahooQuote(sym);
       return res.status(200).json({ ...q, symbol: sym, bid: null, ask: null, lastTradeSize: null, lastTradeTime: null });
-    } catch {
-      return res.status(200).json({ symbol: sym, price: 0, error: 'No Polygon key and Yahoo failed' });
+    } catch (e) {
+      return res.status(200).json({ symbol: sym, price: 0, error: e.message });
     }
   }
 
   try {
     const spot = await fetchPolygonSpot(sym);
 
-    if (!spot.price) {
-      // Polygon returned nothing — Yahoo fallback
-      const q = await fetchYahooQuote(sym);
-      return res.status(200).json({ ...q, symbol: sym, bid: null, ask: null, lastTradeSize: null, lastTradeTime: null });
+    if (!spot || spot.price === 0) {
+      try {
+        const q = await fetchYahooQuote(sym);
+        return res.status(200).json({ ...q, symbol: sym, bid: null, ask: null, lastTradeSize: null, lastTradeTime: null });
+      } catch {
+        return res.status(200).json({ symbol: sym, price: 0, error: 'No price data available' });
+      }
     }
 
     const price     = spot.price;
