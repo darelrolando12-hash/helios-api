@@ -2,6 +2,29 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 200;
 const MAX_PAGES = 10;
 
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+
+// DB-first prevClose — eliminates /v2/aggs/prev in fetchSpot slow path
+async function getDBPrevClose(symbol) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/daily_market_data?symbol=eq.${encodeURIComponent(symbol)}&order=date.desc&limit=1&select=prev_close,date`;
+    const r = await fetch(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const row = rows[0];
+    const rowDate = new Date(row.date + 'T00:00:00');
+    if (Date.now() - rowDate.getTime() > 7 * 24 * 60 * 60 * 1000) return null;
+    return row.prev_close ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -12,7 +35,7 @@ async function polygonFetch(url, attempt = 1) {
 
     if (res.status === 429) {
       if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt * 2);
+        await sleep(RETRY_DELAY_MS * attempt * 2); // longer backoff on rate limit
         return polygonFetch(url, attempt + 1);
       }
       console.error('[chain.js] Polygon 429 after all retries');
@@ -81,6 +104,7 @@ module.exports = async function handler(req, res) {
 
   // RATE LIMIT FIX: Accept pre-fetched spot price from centralDataStore.
   // When ?spot=NNN is passed, skip fetchSpot() entirely — saves 2 Polygon calls per chain fetch.
+  // centralDataStore passes this from its already-cached quote data.
   const { symbol, datesOnly, expiration, allExpiries } = req.query;
   const preloadedSpot = req.query.spot ? parseFloat(req.query.spot) : null;
   const preloadedPrevClose = req.query.prevClose ? parseFloat(req.query.prevClose) : null;
@@ -102,8 +126,12 @@ module.exports = async function handler(req, res) {
   }
 
   // ─── Helper: fetch spot price — SKIPPED if preloadedSpot is provided ──────────
+  // When centralDataStore passes ?spot=NNN, we skip this entirely (saves 2 calls/chain fetch).
+  // Only called when chain.js is hit directly without spot data (e.g. allExpiries mode).
+  // Index tickers: SPX/NDX use /v2/last/trade/I:SPX — NOT /v2/last/stocks (403 on indices)
+  // VIX: returns 0 here — quote.js routes VIX through Yahoo Finance
   const INDEX_TICKER_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', SPXW: 'I:SPX' };
-  // NOTE: VIX removed from INDEX_TICKER_MAP — VIX options don't exist, chain.js never fetches VIX spot
+  // NOTE: VIX removed from INDEX_TICKER_MAP — VIX options are on SPX, chain.js never fetches VIX spot
 
   async function fetchSpot(ticker) {
     // FAST PATH: use pre-fetched data from centralDataStore (eliminates 2 Polygon calls)
@@ -120,19 +148,25 @@ module.exports = async function handler(req, res) {
     try {
       const aggTicker = INDEX_TICKER_MAP[ticker] ?? ticker;
 
-      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${aggTicker}/prev?adjusted=true&apiKey=${polygonKey}`;
-      const prevR = await polygonFetch(prevUrl);
-      let prevClose = 0;
+      // DB-first for prevClose — eliminates /v2/aggs/prev call when DB is warm
+      let prevClose = await getDBPrevClose(ticker);
       let prevVwap = 0;
-      if (prevR) {
-        const prevData = await prevR.json();
-        const bar = prevData?.results?.[0];
-        if (bar) {
-          prevClose = bar.c ?? 0;
-          prevVwap = bar.vw ?? 0;
+
+      if (!prevClose) {
+        // DB miss — fetch from Polygon
+        const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${aggTicker}/prev?adjusted=true&apiKey=${polygonKey}`;
+        const prevR = await polygonFetch(prevUrl);
+        if (prevR) {
+          const prevData = await prevR.json();
+          const bar = prevData?.results?.[0];
+          if (bar) {
+            prevClose = bar.c ?? 0;
+            prevVwap = bar.vw ?? 0;
+          }
         }
       }
 
+      // Live last trade — index uses /v2/last/trade, equity uses /v2/last/stocks
       let livePrice = 0;
       try {
         const isIndex = !!INDEX_TICKER_MAP[ticker];
@@ -168,6 +202,8 @@ module.exports = async function handler(req, res) {
   }
 
   // ─── Helper: detect block trade from conditions array ─────────────────────────
+  // Polygon condition "41" = "Trade Thru Exempt" / large institutional block
+  // We also flag any last_trade.size > 50 contracts as a block print
   function isBlockTrade(contract) {
     const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
     if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
@@ -177,6 +213,7 @@ module.exports = async function handler(req, res) {
 
   // ─── Helper: compute volume-weighted IV for a side ───────────────────────────
   function computeVWIV(contracts, side) {
+    // side = 'call' | 'put'
     let totalVol = 0;
     let weightedIV = 0;
     contracts.forEach(c => {
@@ -214,11 +251,13 @@ module.exports = async function handler(req, res) {
   }
 
   // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
+  // Returns per-expiry GEX data across all upcoming expiries (for stacking)
   if (allExpiries === 'true') {
     try {
       const allDates = await fetchExpiryDates(sym);
+      // Use CT date (America/Chicago) — not UTC which can be a day ahead during CT trading hours
       const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
-      const upcoming = allDates.filter(d => d >= today).slice(0, 8);
+      const upcoming = allDates.filter(d => d >= today).slice(0, 8); // next 8 expiries
 
       if (!upcoming.length) {
         return res.status(200).json({ symbol: sym, expiryGEX: [], source: 'polygon-empty' });
@@ -236,6 +275,7 @@ module.exports = async function handler(req, res) {
               fetchAllPages(putsUrl, polygonKey),
             ]);
 
+            // Quick GEX per strike for this expiry
             const strikeMap = new Map();
             calls.forEach(c => {
               const strike = c.details?.strike_price;
@@ -287,9 +327,10 @@ module.exports = async function handler(req, res) {
       // ── Date validation: verify expiration exists using reference endpoint (works 24/7) ──
       let resolvedExpiration = expiration;
 
+      // Use reference contracts endpoint — this works on weekends/after hours unlike snapshot
       const validDates = await fetchExpiryDates(sym);
       const isValidDate = validDates.includes(expiration);
-
+      
       if (!isValidDate && validDates.length > 0) {
         console.warn(`[chain.js] ${expiration} not in expiry list for ${sym} — sliding to nearest`);
         const nearest = validDates.find(d => d >= expiration) ?? validDates[0];
@@ -310,6 +351,7 @@ module.exports = async function handler(req, res) {
 
       if (callsResults.length === 0 && putsResults.length === 0) {
         console.error(`[chain.js] Polygon returned zero contracts for ${sym} ${resolvedExpiration}`);
+        // Still return spot price so UI can show LAST SESSION price even with no chain data
         const { price: spotForEmpty } = await fetchSpot(sym);
         return res.status(200).json({
           contracts: [],
@@ -352,16 +394,22 @@ module.exports = async function handler(req, res) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
             strike,
+            // Bid/Ask/Last
             callBid: 0, callAsk: 0, callIV: 0, callOI: 0, callVolume: 0,
             callLast: 0, callDayVol: 0, callPrevDayVol: 0, callVolumeRatio: null,
+            // Greeks (Phase 2)
             callDelta: null, callTheta: null, callGamma: null, callVega: null,
+            // Phase 3 Greeks
             callVanna: null, callCharm: null,
+            // Phase 3 extras
             callBlockTrade: false, callIlliquid: false,
+            // Puts
             putBid: 0, putAsk: 0, putIV: 0, putOI: 0, putVolume: 0,
             putLast: 0, putDayVol: 0, putPrevDayVol: 0, putVolumeRatio: null,
             putDelta: null, putTheta: null, putGamma: null, putVega: null,
             putVanna: null, putCharm: null,
             putBlockTrade: false, putIlliquid: false,
+            // ATM/ITM
             atm: false, itmCall: false, itmPut: false,
           });
         }
@@ -374,6 +422,7 @@ module.exports = async function handler(req, res) {
         if (!strike) return;
         const entry = ensureStrike(strike);
 
+        // Polygon v3/snapshot/options: bid/ask live at top-level last_quote, NOT market_data
         const bid  = c.last_quote?.bid ?? c.market_data?.bid ?? 0;
         const ask  = c.last_quote?.ask ?? c.market_data?.ask ?? 0;
         const lastTradePrice = c.last_trade?.price
@@ -388,20 +437,26 @@ module.exports = async function handler(req, res) {
           ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.callOI     = c.open_interest ?? 0;
+        // Polygon puts daily volume in c.day.volume; c.volume is often 0 or missing
         entry.callVolume = c.day?.volume ?? c.volume ?? 0;
+        // Phase 2 Greeks — REAL Polygon data only, no fallback
         const greeks = c.greeks ?? c.details?.greeks ?? {};
         entry.callDelta  = greeks.delta  ?? null;
         entry.callTheta  = greeks.theta  ?? null;
-        entry.callGamma  = greeks.gamma  ?? null;
+        entry.callGamma  = greeks.gamma  ?? null;  // REAL gamma or null — NO FAKE ESTIMATION
         entry.callVega   = greeks.vega   ?? null;
+        // Phase 3 Greeks: vanna & charm
         entry.callVanna  = greeks.vanna  ?? null;
         entry.callCharm  = greeks.charm  ?? null;
+        // Volume ratio
         entry.callDayVol     = c.day?.volume      ?? 0;
         entry.callPrevDayVol = c.prev_day?.volume ?? 0;
         entry.callVolumeRatio = entry.callPrevDayVol > 0
           ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
           : null;
+        // Phase 3: block trade detection
         entry.callBlockTrade = isBlockTrade(c);
+        // Illiquid flag: spread > 50% of ask
         entry.callIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
 
@@ -411,6 +466,7 @@ module.exports = async function handler(req, res) {
         if (!strike) return;
         const entry = ensureStrike(strike);
 
+        // Polygon v3/snapshot/options: bid/ask live at top-level last_quote, NOT market_data
         const bid  = p.last_quote?.bid ?? p.market_data?.bid ?? 0;
         const ask  = p.last_quote?.ask ?? p.market_data?.ask ?? 0;
         const lastTradePrice = p.last_trade?.price
@@ -425,11 +481,13 @@ module.exports = async function handler(req, res) {
           ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.putOI     = p.open_interest ?? 0;
+        // Polygon puts daily volume in p.day.volume; p.volume is often 0 or missing
         entry.putVolume = p.day?.volume ?? p.volume ?? 0;
         entry.putDelta  = p.greeks?.delta  ?? null;
         entry.putTheta  = p.greeks?.theta  ?? null;
-        entry.putGamma  = p.greeks?.gamma  ?? null;
+        entry.putGamma  = p.greeks?.gamma  ?? null;  // REAL gamma or null — NO FAKE ESTIMATION
         entry.putVega   = p.greeks?.vega   ?? null;
+        // Phase 3 Greeks
         entry.putVanna  = p.greeks?.vanna  ?? null;
         entry.putCharm  = p.greeks?.charm  ?? null;
         entry.putDayVol     = p.day?.volume      ?? 0;
@@ -486,6 +544,7 @@ module.exports = async function handler(req, res) {
       const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
       const blockPutCount  = contracts.filter(c => c.putBlockTrade).length;
 
+      // ── DIAGNOSTIC: Log gamma data status ──
       const gammaCount = contracts.filter(c => c.callGamma !== null || c.putGamma !== null).length;
       const sampleContracts = contracts.slice(0, 3).map(c => ({
         strike: c.strike,
@@ -509,6 +568,7 @@ module.exports = async function handler(req, res) {
         impliedMove,
         expiration: resolvedExpiration,
         contracts,
+        // Phase 3 chain-level fields
         vwivCall,
         vwivPut,
         callOIWalls,
