@@ -3,7 +3,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL |
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzgwNDI4NDM3LCJleHAiOjEzMjkxMDY4NDM3fQ.4BVrfm0wglB1rUtX5ZAcouqBtudlk1GTzrVtfoobvUU';
 const CRON_SECRET  = process.env.CRON_SECRET ?? 'helios-cron';
 
-// All 24 platform tickers (matches FEED_TICKERS in tickerSignal.ts)
 const ALL_TICKERS = [
   'SPY', 'QQQ', 'IWM', 'SPX', 'NDX',
   'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMZN', 'META',
@@ -12,18 +11,21 @@ const ALL_TICKERS = [
   'HYG', 'TLT',
 ];
 
-// Tickers to run calibration for (subset — intraday fetch is expensive)
 const CALIBRATION_TICKERS = [
   'SPY', 'QQQ', 'NVDA', 'TSLA', 'AAPL', 'MSFT', 'AMD',
   'META', 'AMZN', 'GOOGL', 'MSTR', 'IWM', 'HOOD',
 ];
 
 // ─── Index ticker normalization ───────────────────────────────────────────────
-// No conversion for aggregate endpoints — use raw symbol (SPX, NDX, VIX).
-// I: prefix returns 403 on Options Advanced plan for /v2/aggs endpoints.
+// For /v2/aggs daily bar fetches, SPX and NDX require the I: prefix.
+// All other tickers (equities, ETFs) use the raw symbol.
+// Note: toPolygonAggTicker is ONLY used in daily-bar/intraday fetches in this cron.
+// The options chain endpoints (chain.js) use a separate passthrough — do not change.
+
+const DAILY_BAR_INDEX_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', SPXW: 'I:SPX' };
 
 function toPolygonAggTicker(ticker) {
-  return ticker;
+  return DAILY_BAR_INDEX_MAP[ticker.toUpperCase()] ?? ticker;
 }
 
 // ─── CT time helpers ──────────────────────────────────────────────────────────
@@ -62,7 +64,10 @@ async function polyFetch(url, attempt = 1) {
       await sleep(backoff);
       return polyFetch(url, attempt + 1);
     }
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[daily-cron] polyFetch ${res.status}: ${url.split('?')[0]}`);
+      return null;
+    }
     return res.json();
   } catch {
     return null;
@@ -87,8 +92,17 @@ async function fetchDailyBars(symbol, years = 5) {
   const fromDate = new Date(Date.now() - years * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
   const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggSym)}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=1500&apiKey=${POLYGON_KEY}`;
-  const data = await polyFetch(url);
-  if (!data?.results?.length) return [];
+
+  // Retry once on empty — handles transient 429 that polyFetch already backed off from
+  let data = await polyFetch(url);
+  if (!data?.results?.length) {
+    await sleep(1200);
+    data = await polyFetch(url);
+  }
+  if (!data?.results?.length) {
+    console.warn(`[daily-cron] fetchDailyBars ${symbol} (${aggSym}): no results returned`);
+    return [];
+  }
 
   return data.results.map(b => ({
     date:   new Date(b.t).toISOString().split('T')[0],
@@ -527,7 +541,6 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Auth — Vercel cron header or secret
   const isVercelCron = req.headers['x-vercel-cron'] === '1';
   const secret       = req.query.secret ?? req.headers['x-cron-secret'];
   if (!isVercelCron && secret !== CRON_SECRET) {
@@ -561,7 +574,7 @@ export default async function handler(req, res) {
 
   const results = { hv: { ok: 0, fail: 0 }, cal: { priors: 0 }, expiry: { ok: 0 }, errors: [] };
 
-  // ── Phase A: HV + ADV (all 25 tickers, serial, 350ms gap) ────────────────
+  // ── Phase A: HV + ADV (all 25 tickers, serial, 700ms gap) ────────────────
   if (phase === 'all' || phase === 'hv') {
     console.log('[daily-cron] === Phase A: HV + ADV ===');
     for (const sym of ALL_TICKERS) {
@@ -572,7 +585,7 @@ export default async function handler(req, res) {
         results.hv.fail++;
         results.errors.push(`HV:${sym}: ${e.message}`);
       }
-      await sleep(350);
+      await sleep(700);
     }
     console.log(`[daily-cron] Phase A done: ${results.hv.ok} ok, ${results.hv.fail} failed`);
   }
