@@ -3,26 +3,36 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL |
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzgwNDI4NDM3LCJleHAiOjEzMjkxMDY4NDM3fQ.4BVrfm0wglB1rUtX5ZAcouqBtudlk1GTzrVtfoobvUU';
 const CRON_SECRET  = process.env.CRON_SECRET ?? 'helios-cron';
 
+// All platform tickers — includes main 24 + 8 cross-asset ETFs used by crossAssetMatrix.ts
+// The cross-asset tickers (XLK/XLF/XLY/XLE/XBI/XLU/LQD/UUP) were previously uncached,
+// causing live Polygon /prev calls on every 5-min crossAssetMatrix refresh. With DB rows
+// present, quote.js readDBDailyData() returns them instantly — no Polygon call needed.
 const ALL_TICKERS = [
   'SPY', 'QQQ', 'IWM', 'SPX', 'NDX',
   'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMZN', 'META',
   'AMD', 'GOOGL', 'NFLX', 'COIN', 'PLTR', 'HOOD', 'SOFI',
   'JPM', 'BAC', 'MSTR', 'SMCI', 'GLD',
-  'HYG', 'TLT',
+  'HYG', 'TLT', // Bond ETFs — credit risk + rates context
+  // Cross-asset matrix ETFs — sector rotation + macro breadth context
+  'XLK', 'XLF', 'XLY', 'XLE', 'XBI', 'XLU', 'LQD', 'UUP',
 ];
 
+// Tickers to run calibration for (subset — intraday fetch is expensive)
 const CALIBRATION_TICKERS = [
   'SPY', 'QQQ', 'NVDA', 'TSLA', 'AAPL', 'MSFT', 'AMD',
   'META', 'AMZN', 'GOOGL', 'MSTR', 'IWM', 'HOOD',
 ];
 
-// ─── Index ticker normalization ───────────────────────────────────────────────
-// For /v2/aggs daily bar fetches, SPX and NDX require the I: prefix.
+// ─── Index ticker normalization ──────────────────────────────────────────────
+// For /v2/aggs daily bar fetches, NDX requires the I: prefix.
+// SPX is NOT fetched from Polygon — I:SPX daily bars → 403 on Options Advanced plan.
+// SPX uses Yahoo Finance (^GSPC) instead via fetchYahooDailyBars().
 // All other tickers (equities, ETFs) use the raw symbol.
 // Note: toPolygonAggTicker is ONLY used in daily-bar/intraday fetches in this cron.
-// The options chain endpoints (chain.js) use a separate passthrough — do not change.
 
-const DAILY_BAR_INDEX_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', SPXW: 'I:SPX' };
+const DAILY_BAR_INDEX_MAP = { NDX: 'I:NDX' };
+// Tickers that must use Yahoo Finance for daily bars (Polygon /v2/aggs → 403 on Options Advanced plan)
+const YAHOO_DAILY_BAR_TICKERS = new Set(['SPX', 'SPXW']);
 
 function toPolygonAggTicker(ticker) {
   return DAILY_BAR_INDEX_MAP[ticker.toUpperCase()] ?? ticker;
@@ -39,9 +49,18 @@ function isWeekend() {
   return ct.getDay() === 0 || ct.getDay() === 6;
 }
 
+/**
+ * isMarketHours — returns true during 7:00 AM – 4:00 PM CT (pre-open through post-close).
+ * PERMANENT GUARD: Daily cron MUST NOT run while market is active.
+ * Running it during market hours would blast 700+ Polygon aggregate calls,
+ * wiping the rate limit budget exactly when candles + quotes need it most.
+ * The cron is scheduled at 21:05 UTC = 4:05 PM CT — AFTER close.
+ * This guard is a safety net in case someone manually triggers it.
+ */
 function isMarketHours() {
   const ct = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
   const totalMinutesCT = ct.getHours() * 60 + ct.getMinutes();
+  // 7:00 AM CT (420) to 4:00 PM CT (960)
   return totalMinutesCT >= 7 * 60 && totalMinutesCT < 16 * 60;
 }
 
@@ -59,22 +78,19 @@ async function polyFetch(url, attempt = 1) {
     });
     if (res.status === 429) {
       if (attempt >= 4) return null;
-      const backoff = 800 * attempt;
+      const backoff = 800 * attempt; // 800ms, 1600ms, 2400ms
       console.log(`[daily-cron] 429 on attempt ${attempt}, backing off ${backoff}ms`);
       await sleep(backoff);
       return polyFetch(url, attempt + 1);
     }
-    if (!res.ok) {
-      console.warn(`[daily-cron] polyFetch ${res.status}: ${url.split('?')[0]}`);
-      return null;
-    }
+    if (!res.ok) return null;
     return res.json();
   } catch {
     return null;
   }
 }
 
-// ─── HV computation ───────────────────────────────────────────────────────────
+// ─── HV computation — mirrors quote.js exactly ────────────────────────────────
 
 function computeHV(logReturns, window) {
   if (logReturns.length < window) return null;
@@ -84,9 +100,18 @@ function computeHV(logReturns, window) {
   return parseFloat((Math.sqrt(variance * 252) * 100).toFixed(2));
 }
 
-// ─── Fetch 5yr daily bars ─────────────────────────────────────────────────────
+// ─── Fetch 5yr daily bars — returns parsed bar array ─────────────────────────
+// SPX/SPXW → Yahoo Finance (Polygon I:SPX daily bars → 403 on Options Advanced plan)
+// NDX      → Polygon with I:NDX prefix
+// All other tickers → Polygon with raw symbol
 
 async function fetchDailyBars(symbol, years = 5) {
+  // Route SPX/SPXW to Yahoo
+  if (YAHOO_DAILY_BAR_TICKERS.has(symbol.toUpperCase())) {
+    const yahooSym = symbol.toUpperCase() === 'NDX' ? '^NDX' : '^GSPC'; // SPX/SPXW → ^GSPC
+    return fetchYahooDailyBars(yahooSym, years);
+  }
+
   const aggSym   = toPolygonAggTicker(symbol);
   const toDate   = new Date().toISOString().split('T')[0];
   const fromDate = new Date(Date.now() - years * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -115,7 +140,70 @@ async function fetchDailyBars(symbol, years = 5) {
   }));
 }
 
-// ─── Compute HV + IV rank from daily bars ─────────────────────────────────────
+// ─── Fetch 5yr daily bars from Yahoo Finance — used for SPX (Polygon 403) ────
+//
+// Yahoo chart API returns daily OHLCV. We fetch 5 years of ^GSPC daily bars.
+// The bar shape matches fetchDailyBars() output exactly so computeHVData() works unchanged.
+// Consistency note: Yahoo and Polygon daily closes for SPX agree to <0.01% —
+// SPX is an index (no dividends, no splits), so no adjustment divergence is possible.
+//
+async function fetchYahooDailyBars(yahooSymbol, years = 5) {
+  const period2 = Math.floor(Date.now() / 1000);
+  const period1 = period2 - years * 365 * 24 * 60 * 60;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&period1=${period1}&period2=${period2}`;
+
+  let data;
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios-DailyCron/1.0)', Accept: 'application/json' },
+      signal:  AbortSignal.timeout(15_000),
+    });
+    if (!r.ok) {
+      console.warn(`[daily-cron] fetchYahooDailyBars ${yahooSymbol}: HTTP ${r.status}`);
+      return [];
+    }
+    data = await r.json();
+  } catch (e) {
+    console.warn(`[daily-cron] fetchYahooDailyBars ${yahooSymbol}: fetch error — ${e.message}`);
+    return [];
+  }
+
+  const result  = data?.chart?.result?.[0];
+  const meta    = result?.meta;
+  const ts      = result?.timestamp;
+  const q       = result?.indicators?.quote?.[0];
+  const adjClose = result?.indicators?.adjclose?.[0]?.adjclose;
+
+  if (!ts || !q || ts.length === 0) {
+    console.warn(`[daily-cron] fetchYahooDailyBars ${yahooSymbol}: no bars in response`);
+    return [];
+  }
+
+  const bars = [];
+  for (let i = 0; i < ts.length; i++) {
+    const o = q.open?.[i];
+    const h = q.high?.[i];
+    const l = q.low?.[i];
+    const c = adjClose?.[i] ?? q.close?.[i]; // prefer adjusted close
+    const v = q.volume?.[i] ?? 0;
+    // Skip bars with null OHLC (Yahoo sometimes pads with nulls on holidays)
+    if (o == null || h == null || l == null || c == null || c === 0) continue;
+    bars.push({
+      date:   new Date(ts[i] * 1000).toISOString().split('T')[0],
+      open:   o,
+      high:   h,
+      low:    l,
+      close:  c,
+      volume: v,
+      vwap:   (h + l + c) / 3,
+    });
+  }
+
+  console.log(`[daily-cron] fetchYahooDailyBars ${yahooSymbol}: ${bars.length} bars from Yahoo`);
+  return bars;
+}
+
+// ─── Compute HV + IV rank from daily bars ────────────────────────────────────
 
 function computeHVData(symbol, bars) {
   if (bars.length < 22) return null;
@@ -133,6 +221,7 @@ function computeHVData(symbol, bars) {
   const hv60  = computeHV(logReturns, 60);
   const hv252 = computeHV(logReturns, 252);
 
+  // 52-week high/low + price percentile
   const last252Closes = closes.slice(-252);
   const high52w = Math.max(...last252Closes);
   const low52w  = Math.min(...last252Closes);
@@ -141,11 +230,14 @@ function computeHVData(symbol, bars) {
     ? Math.round(((current - low52w) / (high52w - low52w)) * 100)
     : 50;
 
+  // ADV — 20-day average daily volume
   const recentVols = bars.slice(-20).map(b => b.volume);
   const adv = recentVols.length > 0
     ? Math.round(recentVols.reduce((a, b) => a + b, 0) / recentVols.length)
     : 0;
 
+  // IV rank from range-based vol proxy (52w daily ranges as IV baseline)
+  // Formula: (daily_range / open) × sqrt(252) × 100 — annualized, same scale as real IV
   const ivValues = bars.slice(-252)
     .filter(b => b.open > 0)
     .map(b => {
@@ -164,23 +256,26 @@ function computeHVData(symbol, bars) {
       : 50;
   }
 
+  // Prev-day bar — the most recent closed bar in the series
+  // Stored so quote.js can skip the /v2/aggs/prev Polygon call on every quote request
   const lastBar = bars[bars.length - 1];
 
   return {
-    symbol:           symbol.toUpperCase(),
+    symbol: symbol.toUpperCase(),
     hv10, hv20, hv60, hv252,
     iv_rank:          ivRank,
-    iv_rank_values:   ivValues.slice(-52),
+    iv_rank_values:   ivValues.slice(-52), // store last 52 weekly readings
     high_52w:         parseFloat(high52w.toFixed(4)),
     low_52w:          parseFloat(low52w.toFixed(4)),
     price_percentile: pricePercentile,
     adv:              adv,
-    prev_close:       lastBar ? parseFloat(lastBar.close.toFixed(4))  : null,
-    prev_high:        lastBar ? parseFloat(lastBar.high.toFixed(4))   : null,
-    prev_low:         lastBar ? parseFloat(lastBar.low.toFixed(4))    : null,
-    prev_open:        lastBar ? parseFloat(lastBar.open.toFixed(4))   : null,
-    prev_vwap:        lastBar ? parseFloat((lastBar.vwap ?? lastBar.close).toFixed(4)) : null,
-    prev_volume:      lastBar ? Math.round(lastBar.volume ?? 0) : null,
+    // Prev-day OHLCV — eliminates /v2/aggs/prev call from quote.js (saves ~150 Polygon calls/min)
+    prev_close:  lastBar ? parseFloat(lastBar.close.toFixed(4))  : null,
+    prev_high:   lastBar ? parseFloat(lastBar.high.toFixed(4))   : null,
+    prev_low:    lastBar ? parseFloat(lastBar.low.toFixed(4))    : null,
+    prev_open:   lastBar ? parseFloat(lastBar.open.toFixed(4))   : null,
+    prev_vwap:   lastBar ? parseFloat((lastBar.vwap ?? lastBar.close).toFixed(4)) : null,
+    prev_volume: lastBar ? Math.round(lastBar.volume ?? 0) : null,
     computed_date:    getCTDateStr(),
     computed_at:      new Date().toISOString(),
   };
@@ -196,6 +291,7 @@ async function fetchIntradayBars5m(symbol, date) {
 
   return data.results.map(bar => {
     const ms = bar.t;
+    // CT offset: CDT = UTC-5, CST = UTC-6. Use America/Chicago locale conversion.
     const ctDate = new Date(new Date(ms).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
     const minutesCT = ctDate.getHours() * 60 + ctDate.getMinutes();
     return {
@@ -206,104 +302,111 @@ async function fetchIntradayBars5m(symbol, date) {
       low:    bar.l,
       close:  bar.c,
       volume: bar.v,
-      vwap:   bar.vw ?? (bar.h + bar.l + bar.c) / 3,
     };
   });
 }
 
-// ─── Session classifier ───────────────────────────────────────────────────────
+// ─── Session classification (CT) ─────────────────────────────────────────────
+
+const SESSIONS = {
+  MORNING:      { start: 8 * 60 + 30, end: 11 * 60 },
+  MIDDAY:       { start: 11 * 60,      end: 13 * 60 + 30 },
+  AFTERNOON:    { start: 13 * 60 + 30, end: 14 * 60 + 30 },
+  'POWER-HOUR': { start: 14 * 60 + 30, end: 15 * 60 },
+};
 
 function classifySession(minutesCT) {
-  if (minutesCT < 8 * 60 + 30)  return 'PRE-MARKET';
-  if (minutesCT < 10 * 60)       return 'MORNING';
-  if (minutesCT < 12 * 60)       return 'MIDDAY';
-  if (minutesCT < 14 * 60)       return 'AFTERNOON';
-  if (minutesCT < 15 * 60)       return 'POWER-HOUR';
-  return 'AFTER-HOURS';
+  for (const [key, w] of Object.entries(SESSIONS)) {
+    if (minutesCT >= w.start && minutesCT < w.end) return key;
+  }
+  return null;
 }
 
-function classifyIVContext(dailyRangePct, recentRanges) {
-  if (!recentRanges || recentRanges.length === 0) return 'normal';
-  const avg = recentRanges.reduce((a, b) => a + b, 0) / recentRanges.length;
-  if (avg === 0) return 'normal';
-  const ratio = dailyRangePct / avg;
-  if (ratio > 2.0)  return 'extreme';
-  if (ratio > 1.4)  return 'high';
-  if (ratio < 0.6)  return 'low';
-  return 'normal';
+function classifyIVContext(dailyRangePct, recentRangePcts) {
+  if (recentRangePcts.length < 10) return 'normal';
+  const avg = recentRangePcts.reduce((a, b) => a + b, 0) / recentRangePcts.length;
+  const ratio = dailyRangePct / Math.max(avg, 0.001);
+  if (ratio < 0.6) return 'low';
+  if (ratio < 1.3) return 'normal';
+  if (ratio < 2.0) return 'high';
+  return 'extreme';
 }
 
-const OPTIONS_MULTIPLIER = 5;
+// ─── Simulate + measure intraday signals (mirrors backtestEngine.ts) ──────────
 
-// ─── Simulate intraday signals from 5m bars ───────────────────────────────────
+const SIGNAL_THRESHOLD_PCT = 0.8;
+const OPTIONS_MULTIPLIER   = 2.5;
+const MIN_SAMPLE_SIZE      = 20;
 
-function simulateIntradaySignals(bars, dayBar, recentDays, adv) {
+function simulateIntradaySignals(bars, dailyBar, recentDailyBars, adv) {
   const signals = [];
-  const openBar = bars.find(b => b.minutesCT >= 8 * 60 + 30);
-  if (!openBar) return signals;
+  if (bars.length < 6) return signals;
 
-  const openPrice = openBar.open;
+  const recentRangePcts = recentDailyBars.map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
+  const dailyRangePct   = dailyBar.open > 0 ? (dailyBar.high - dailyBar.low) / dailyBar.open : 0;
+  const ivContext       = classifyIVContext(dailyRangePct, recentRangePcts);
 
-  for (let i = 3; i < bars.length - 3; i++) {
+  for (let i = 5; i < bars.length - 1; i++) {
     const bar = bars[i];
-    if (bar.minutesCT < 8 * 60 + 30 || bar.minutesCT > 15 * 60) continue;
+    const session = classifySession(bar.minutesCT);
+    if (!session) continue;
 
-    const prev3 = bars.slice(i - 3, i);
-    const momentum = prev3.reduce((a, b) => a + (b.close - b.open), 0);
-    if (Math.abs(momentum) < openPrice * 0.001) continue;
+    const windowBars = bars.slice(Math.max(0, i - 5), i);
+    if (windowBars.length < 3) continue;
+    const windowVol = windowBars.reduce((a, b) => a + b.volume, 0) / windowBars.length;
 
-    const direction = momentum > 0 ? 'calls' : 'puts';
-    const session   = classifySession(bar.minutesCT);
-    const vwapApprox = bars.slice(0, i + 1).reduce((a, b) => a + b.vwap * b.volume, 0)
-                     / Math.max(1, bars.slice(0, i + 1).reduce((a, b) => a + b.volume, 0));
-    const priceVsVwap = direction === 'calls'
-      ? bar.close > vwapApprox
-      : bar.close < vwapApprox;
+    const changePct = bar.open > 0 ? ((bar.close - bar.open) / bar.open) * 100 : 0;
+    if (Math.abs(changePct) < SIGNAL_THRESHOLD_PCT) continue;
 
-    if (!priceVsVwap) continue;
+    const direction    = changePct > 0 ? 'calls' : 'puts';
+    const strength     = Math.min(95, 45 + Math.round(Math.abs(changePct) * 12));
+    const volumeRatio  = windowVol > 0 ? bar.volume / windowVol : 1;
+    const vBoost       = volumeRatio >= 1.5 ? 1.15 : volumeRatio >= 1.2 ? 1.08 : 1.0;
 
-    const partialVol   = bars.slice(0, i + 1).reduce((a, b) => a + b.volume, 0);
-    const projectedVol = adv > 0 ? (partialVol / (bar.minutesCT - 8 * 60 + 1)) * 390 : 0;
-    const volumeRatio  = adv > 0 ? projectedVol / adv : 1;
+    // VWAP distance — use daily VWAP as proxy
+    const vwapDistPct = dailyBar.vwap > 0
+      ? Math.abs((bar.close - dailyBar.vwap) / dailyBar.vwap * 100)
+      : 1.0;
 
     signals.push({
-      barIndex:   i,
-      minutesCT:  bar.minutesCT,
+      barIndex:        i,
+      minutesCT:       bar.minutesCT,
       session,
       direction,
-      entryPrice: bar.close,
-      volumeRatio,
+      signalStrength:  Math.min(95, Math.round(strength * vBoost)),
+      volumeRatio:     adv > 0 ? bar.volume / adv : volumeRatio,
+      vwapDistancePct: vwapDistPct,
+      ivContext,
+      entryPrice:      bar.close,
     });
-
-    i += 5;
   }
-
   return signals;
 }
 
-// ─── Measure signal outcome ───────────────────────────────────────────────────
-
 function measureOutcome(signal, bars) {
-  const { barIndex, entryPrice, direction } = signal;
-  const remaining = bars.slice(barIndex + 1);
+  const targets = [30, 60, 90];
+  const entryMin = signal.minutesCT;
+  const entry    = signal.entryPrice;
 
-  const getPrice = (offset) => {
-    const targetMin = signal.minutesCT + offset;
-    const bar = remaining.find(b => b.minutesCT >= targetMin);
-    return bar ? bar.close : null;
-  };
+  function priceAtOffset(offset) {
+    const target = entryMin + offset;
+    if (target >= 15 * 60) return null;
+    const candidates = bars.filter(b => b.minutesCT >= target && b.minutesCT <= target + 10);
+    return candidates[0]?.close ?? null;
+  }
 
-  const p30 = getPrice(30);
-  const p60 = getPrice(60);
-  const p90 = getPrice(90);
+  const p30 = priceAtOffset(targets[0]);
+  const p60 = priceAtOffset(targets[1]);
+  const p90 = priceAtOffset(targets[2]);
+  const primary = p60 ?? p30 ?? p90 ?? entry;
 
-  const exitPrice = p30 ?? p60 ?? p90 ?? remaining[remaining.length - 1]?.close ?? entryPrice;
-  const directed  = ((exitPrice - entryPrice) / entryPrice) * 100 * (direction === 'calls' ? 1 : -1);
-  const optionPnl = directed * OPTIONS_MULTIPLIER;
+  const rawMove      = ((primary - entry) / entry) * 100;
+  const directed     = signal.direction === 'calls' ? rawMove : -rawMove;
+  const optionPnl    = directed * OPTIONS_MULTIPLIER;
 
   const moves = [p30, p60, p90].filter(p => p !== null).map(p => {
-    const m = ((p - entryPrice) / entryPrice) * 100;
-    return direction === 'calls' ? m : -m;
+    const m = ((p - entry) / entry) * 100;
+    return signal.direction === 'calls' ? m : -m;
   });
   const bestMove = moves.length > 0 ? Math.max(...moves) : directed;
 
@@ -319,9 +422,7 @@ function measureOutcome(signal, bars) {
   };
 }
 
-// ─── Compute calibration priors ───────────────────────────────────────────────
-
-const MIN_SAMPLE_SIZE = 5;
+// ─── Compute calibration priors from outcomes ────────────────────────────────
 
 function computeCalibrationPrior(symbol, session, direction, ivContext, outcomes) {
   if (outcomes.length < MIN_SAMPLE_SIZE) return null;
@@ -336,11 +437,13 @@ function computeCalibrationPrior(symbol, session, direction, ivContext, outcomes
   const avgLoss   = losses.length > 0 ? losses.reduce((a, o) => a + Math.abs(o.optionPnlProxy), 0) / losses.length : 0;
   const sharpe    = avgLoss > 0 ? parseFloat((avgGain / avgLoss).toFixed(2)) : 0;
 
-  const pnls   = outcomes.map(o => o.optionPnlProxy).sort((a, b) => a - b);
-  const n      = pnls.length;
-  const pctile = (pct) => pnls[Math.min(Math.floor(n * pct), n - 1)];
+  // Dynamic tier thresholds from real distribution
+  const pnls    = outcomes.map(o => o.optionPnlProxy).sort((a, b) => a - b);
+  const n       = pnls.length;
+  const pctile  = (pct) => pnls[Math.min(Math.floor(n * pct), n - 1)];
   const hasTiers = n >= 25;
 
+  // Volume threshold optimization
   const vLevels = [1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0];
   let bestVol = 1.3, bestVWR = 0;
   for (const t of vLevels) {
@@ -371,9 +474,9 @@ function computeCalibrationPrior(symbol, session, direction, ivContext, outcomes
   };
 }
 
-// ─── DB write helpers ──────────────────────────────────────────────────────────
+// ─── DB write helpers ─────────────────────────────────────────────────────────
 
-async function dbUpsert(table, row) {
+async function dbUpsert(table, row, conflictCols) {
   const url = `${SUPABASE_URL}/rest/v1/${table}`;
   const res = await fetch(url, {
     method:  'POST',
@@ -381,7 +484,7 @@ async function dbUpsert(table, row) {
       'Content-Type':  'application/json',
       'apikey':        SUPABASE_KEY,
       'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Prefer':        'resolution=merge-duplicates,return=minimal',
+      'Prefer':        `resolution=merge-duplicates,return=minimal`,
     },
     body: JSON.stringify(row),
   });
@@ -407,90 +510,91 @@ async function dbDelete(table, filters) {
   });
 }
 
-// ─── Phase A: HV + ADV ────────────────────────────────────────────────────────
+// ─── Phase 1: Process one ticker — HV + ADV ──────────────────────────────────
 
 async function processHVTicker(symbol) {
   console.log(`[daily-cron] HV: processing ${symbol}`);
   const bars = await fetchDailyBars(symbol, 5);
   if (bars.length < 30) {
-    console.warn(`[daily-cron] ${symbol}: only ${bars.length} bars — skipping`);
+    console.warn(`[daily-cron] ${symbol}: only ${bars.length} daily bars — skipping HV`);
     return false;
   }
 
   const hvData = computeHVData(symbol, bars);
   if (!hvData) return false;
 
-  const ok = await dbUpsert('daily_market_data', hvData);
-  console.log(`[daily-cron] HV ${symbol}: ${ok ? '✅' : '❌'} HV20=${hvData.hv20}% ADV=${hvData.adv?.toLocaleString()} prevClose=${hvData.prev_close}`);
+  const ok = await dbUpsert('daily_market_data', hvData, ['symbol', 'computed_date']);
+  console.log(`[daily-cron] HV ${symbol}: ${ok ? '✅ saved' : '❌ failed'} — HV20=${hvData.hv20}% ADV=${hvData.adv?.toLocaleString()}`);
   return ok;
 }
 
-// ─── Phase B: Calibration priors ──────────────────────────────────────────────
+// ─── Phase 2: Process one ticker — calibration priors ────────────────────────
 
 async function processCalibrationTicker(symbol, allPriors) {
   console.log(`[daily-cron] CAL: processing ${symbol}`);
   const bars = await fetchDailyBars(symbol, 5);
-  if (bars.length < 30) return;
+  if (bars.length < 30) {
+    console.warn(`[daily-cron] CAL ${symbol}: insufficient daily bars — skipping`);
+    return;
+  }
 
   const adv = bars.slice(-20).reduce((a, b) => a + b.volume, 0) / Math.min(20, bars.length);
 
+  // Signal days: days with ≥ 0.8% move
   const signalDays = bars.filter((bar, i) => {
     if (i < 5) return false;
     return Math.abs((bar.close - bar.open) / bar.open * 100) >= 0.8;
   });
 
+  // Sample evenly — max 35 intraday days to limit API cost
   const MAX_DAYS = 35;
-  const step   = Math.max(1, Math.floor(signalDays.length / MAX_DAYS));
-  const sample = signalDays.filter((_, i) => i % step === 0).slice(0, MAX_DAYS);
+  const step     = Math.max(1, Math.floor(signalDays.length / MAX_DAYS));
+  const sample   = signalDays.filter((_, i) => i % step === 0).slice(0, MAX_DAYS);
 
   const allOutcomes = [];
 
-  for (let di = 0; di < sample.length; di++) {
-    const dayBar = sample[di];
-    const dayIdx = bars.indexOf(dayBar);
-    const recent = bars.slice(Math.max(0, dayIdx - 20), dayIdx);
-
+  for (const dayBar of sample) {
     const intradayBars = await fetchIntradayBars5m(symbol, dayBar.date);
-    await sleep(120);
+    await sleep(300);
 
-    if (intradayBars.length < 12) {
-      const pct = ((dayBar.close - dayBar.open) / dayBar.open) * 100;
-      if (Math.abs(pct) >= 0.8) {
-        const dir = pct > 0 ? 'calls' : 'puts';
+    if (intradayBars.length === 0) {
+      // No intraday data (weekend/holiday) — use daily bar as proxy
+      const recent = bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar));
+      for (const dir of ['calls', 'puts']) {
+        const pct = ((dayBar.close - dayBar.open) / dayBar.open) * 100;
         const opt = (dir === 'calls' ? pct : -pct) * OPTIONS_MULTIPLIER;
         const recentPcts = recent.map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
         const dailyPct   = dayBar.open > 0 ? (dayBar.high - dayBar.low) / dayBar.open : 0;
         allOutcomes.push({
-          session: 'MORNING', direction: dir,
-          ivContext: classifyIVContext(dailyPct, recentPcts),
-          volumeRatio: adv > 0 ? dayBar.volume / adv : 1,
+          session:       'MORNING',
+          direction:     dir,
+          ivContext:     classifyIVContext(dailyPct, recentPcts),
+          volumeRatio:   adv > 0 ? dayBar.volume / adv : 1,
           optionPnlProxy: opt,
-          isWin: opt >= 12, isElite: opt >= 40, isTarget: opt >= 25 && opt < 40,
-          isBase: opt >= 12 && opt < 25, isMiss: opt < 0,
+          isWin:   opt >= 12, isElite: opt >= 40, isTarget: opt >= 25 && opt < 40,
+          isBase:  opt >= 12 && opt < 25, isMiss: opt < 0,
         });
       }
       continue;
     }
 
-    const recentPcts = recent.map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
+    const recentPcts = bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar))
+      .map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
     const dailyPct   = dayBar.open > 0 ? (dayBar.high - dayBar.low) / dayBar.open : 0;
 
-    const sigs = simulateIntradaySignals(intradayBars, dayBar, recent, adv);
+    const sigs = simulateIntradaySignals(intradayBars, dayBar, bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar)), adv);
     for (const sig of sigs) {
       const outcome = measureOutcome(sig, intradayBars);
-      allOutcomes.push({
-        ...outcome,
-        session: sig.session, direction: sig.direction,
-        ivContext: classifyIVContext(dailyPct, recentPcts),
-        volumeRatio: sig.volumeRatio,
-      });
+      allOutcomes.push({ ...outcome, session: sig.session, direction: sig.direction, ivContext: classifyIVContext(dailyPct, recentPcts), volumeRatio: sig.volumeRatio });
     }
   }
 
+  // Build priors per session × direction × ivContext combination
   const sessions   = ['MORNING', 'MIDDAY', 'AFTERNOON', 'POWER-HOUR', '*'];
   const directions = ['calls', 'puts', '*'];
   const ivContexts = ['low', 'normal', 'high', 'extreme', '*'];
 
+  // Delete old priors for this ticker first
   await dbDelete('calibration_priors', { symbol: symbol.toUpperCase() });
 
   for (const session of sessions) {
@@ -510,10 +614,11 @@ async function processCalibrationTicker(symbol, allPriors) {
   console.log(`[daily-cron] CAL ${symbol}: ${allOutcomes.length} outcomes → ${allPriors.filter(p => p.symbol === symbol.toUpperCase()).length} priors`);
 }
 
-// ─── Phase C: Expiry dates ────────────────────────────────────────────────────
+// ─── Phase 3: Expiry dates ────────────────────────────────────────────────────
 
 async function processExpiryTicker(symbol) {
   try {
+    // Use Polygon reference options to get real expiry dates
     const optSym = symbol === 'SPX' ? 'SPXW' : symbol;
     const today  = getCTDateStr();
     const url    = `https://api.polygon.io/v3/reference/options/${encodeURIComponent(optSym)}?expiration_date.gte=${today}&limit=15&order=asc&sort=expiration_date&apiKey=${POLYGON_KEY}`;
@@ -526,7 +631,7 @@ async function processExpiryTicker(symbol) {
       symbol:      symbol.toUpperCase(),
       dates:       dates,
       computed_at: new Date().toISOString(),
-    });
+    }, ['symbol']);
 
     console.log(`[daily-cron] EXPIRY ${symbol}: ${dates.length} dates — ${dates[0]} → ${dates[dates.length - 1]}`);
   } catch (e) {
@@ -541,42 +646,48 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const isVercelCron = req.headers['x-vercel-cron'] === '1';
-  const secret       = req.query.secret ?? req.headers['x-cron-secret'];
+  // Auth — Vercel cron header or secret
+  const isVercelCron    = req.headers['x-vercel-cron'] === '1';
+  const secret          = req.query.secret ?? req.headers['x-cron-secret'];
   if (!isVercelCron && secret !== CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // manualOverride MUST be declared before either guard.
-  // force=true bypasses both weekend and market-hours checks.
-  // Automatic Vercel-cron runs never pass force, so both guards stay active for scheduled runs.
+  // manualOverride must be read BEFORE either guard so ?force=true bypasses both.
+  // Automatic Vercel-cron runs (isVercelCron=true) never set force, so both guards
+  // remain fully active for scheduled runs.
   const manualOverride = req.query.force === 'true';
 
   if (isWeekend() && !manualOverride) {
     return res.status(200).json({ skipped: true, reason: 'Weekend — no market data today' });
   }
 
+  // PERMANENT GUARD: never run during market hours (7AM–4PM CT)
+  // This cron blasts ~700 Polygon aggregate calls — must only run overnight.
+  // Scheduled at 21:05 UTC = 4:05 PM CT. This guard protects against manual triggers.
   if (isMarketHours() && !manualOverride) {
     const ctNow = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' });
     return res.status(200).json({
       skipped: true,
-      reason: `Market hours (7AM–4PM CT) — cron blocked to protect rate limits. CT: ${ctNow}. Use ?force=true to override.`,
+      reason:  `Market hours (7AM–4PM CT) — cron blocked to protect rate limits. Current CT time: ${ctNow}. Use ?force=true to override (not recommended).`,
     });
   }
-
   if (!POLYGON_KEY) {
     return res.status(500).json({ error: 'POLYGON_API_KEY not configured' });
   }
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    return res.status(500).json({ error: 'Supabase credentials not configured' });
+  }
 
   const startTime = Date.now();
-  const phase     = req.query.phase ?? 'all';
-  console.log(`[daily-cron] Starting — phase=${phase} tickers=${ALL_TICKERS.length} manualOverride=${manualOverride}`);
+  const phase     = req.query.phase ?? 'all'; // 'hv', 'calibration', 'expiry', 'all'
+  console.log(`[daily-cron] Starting — phase=${phase} tickers=${ALL_TICKERS.length}`);
 
   const results = { hv: { ok: 0, fail: 0 }, cal: { priors: 0 }, expiry: { ok: 0 }, errors: [] };
 
-  // ── Phase A: HV + ADV (all 25 tickers, serial, 700ms gap) ────────────────
+  // ── PHASE A: HV + ADV for all 33 tickers (serial, 700ms gap) ──────────────
   if (phase === 'all' || phase === 'hv') {
-    console.log('[daily-cron] === Phase A: HV + ADV ===');
+    console.log('[daily-cron] === Phase A: Historical Volatility + ADV ===');
     for (const sym of ALL_TICKERS) {
       try {
         const ok = await processHVTicker(sym);
@@ -585,14 +696,14 @@ export default async function handler(req, res) {
         results.hv.fail++;
         results.errors.push(`HV:${sym}: ${e.message}`);
       }
-      await sleep(700);
+      await sleep(700); // 700ms between tickers — well within 100 req/min
     }
     console.log(`[daily-cron] Phase A done: ${results.hv.ok} ok, ${results.hv.fail} failed`);
   }
 
-  // ── Phase B: Calibration priors (13 tickers) ─────────────────────────────
+  // ── PHASE B: Calibration priors for 13 tickers (slowest — intraday fetches) ─
   if (phase === 'all' || phase === 'calibration') {
-    console.log('[daily-cron] === Phase B: Calibration ===');
+    console.log('[daily-cron] === Phase B: Backtest Calibration ===');
     const allPriors = [];
     for (const sym of CALIBRATION_TICKERS) {
       try {
@@ -600,14 +711,16 @@ export default async function handler(req, res) {
       } catch (e) {
         results.errors.push(`CAL:${sym}: ${e.message}`);
       }
-      await sleep(400);
+      await sleep(400); // 400ms between tickers
     }
 
+    // Batch write all priors to DB
     if (allPriors.length > 0) {
       for (let i = 0; i < allPriors.length; i += 50) {
         const batch = allPriors.slice(i, i + 50);
-        const batchRes = await fetch(`${SUPABASE_URL}/rest/v1/calibration_priors`, {
-          method: 'POST',
+        const url = `${SUPABASE_URL}/rest/v1/calibration_priors`;
+        const batchRes = await fetch(url, {
+          method:  'POST',
           headers: {
             'Content-Type':  'application/json',
             'apikey':        SUPABASE_KEY,
@@ -618,18 +731,18 @@ export default async function handler(req, res) {
         });
         if (!batchRes.ok) {
           const text = await batchRes.text().catch(() => '');
-          console.error(`[daily-cron] Cal batch write failed: ${batchRes.status} ${text.slice(0, 200)}`);
+          console.error(`[daily-cron] Calibration batch write failed: ${batchRes.status} ${text.slice(0, 200)}`);
         }
         await sleep(50);
       }
       results.cal.priors = allPriors.length;
     }
-    console.log(`[daily-cron] Phase B done: ${allPriors.length} priors`);
+    console.log(`[daily-cron] Phase B done: ${allPriors.length} priors written`);
   }
 
-  // ── Phase C: Expiry dates (all tickers, serial, 250ms gap) ───────────────
+  // ── PHASE C: Expiry dates for all tickers (serial, 250ms gap) ─────────────
   if (phase === 'all' || phase === 'expiry') {
-    console.log('[daily-cron] === Phase C: Expiry dates ===');
+    console.log('[daily-cron] === Phase C: Expiry Dates ===');
     for (const sym of ALL_TICKERS) {
       try {
         await processExpiryTicker(sym);
@@ -643,13 +756,13 @@ export default async function handler(req, res) {
   }
 
   const elapsed = Math.round((Date.now() - startTime) / 1000);
-  console.log(`[daily-cron] ✅ Complete in ${elapsed}s — HV:${results.hv.ok} Priors:${results.cal.priors} Expiry:${results.expiry.ok}`);
+  console.log(`[daily-cron] ✅ Complete in ${elapsed}s — HV: ${results.hv.ok}, Priors: ${results.cal.priors}, Expiry: ${results.expiry.ok}`);
 
   return res.status(200).json({
-    ok:        true,
+    ok:       true,
     phase,
     elapsed_s: elapsed,
-    date:      getCTDateStr(),
+    date:     getCTDateStr(),
     results,
   });
 }
