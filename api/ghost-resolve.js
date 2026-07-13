@@ -12,235 +12,253 @@ function isMarketHours() {
   return total >= 8 * 60 + 30 && total <= 15 * 60;
 }
 
+// ── DB helper — read prev-day data from daily_market_data ────────────────────
+// Eliminates /v2/aggs/prev calls when DB has fresh data.
+// Same logic as quote.js and chain.js readDBDailyData() — permanent rate-limit fix.
+
+async function readDBDailyData(symbol) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/daily_market_data?symbol=eq.${encodeURIComponent(symbol)}&order=computed_date.desc&limit=1&select=*`;
+    const r = await fetch(url, {
+      headers: {
+        'apikey':         SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+      },
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const row = rows[0];
+    // Reject if data is older than 7 days
+    const rowDate = new Date(row.computed_date + 'T00:00:00');
+    const ageMs   = Date.now() - rowDate.getTime();
+    if (ageMs > 7 * 24 * 60 * 60 * 1000) {
+      console.warn(`[ghost-resolve.js] DB daily_market_data stale for ${symbol} (${row.computed_date}) — falling back to Polygon`);
+      return null;
+    }
+    return row;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Fetch live price ─────────────────────────────────────────────────────────
+// RATE LIMIT FIX: DB-first for prev-day close, same as quote.js and chain.js.
+//   BEFORE: /v2/aggs/prev on every ghost resolution = ~10–20 calls every 5 min
+//   AFTER:  DB-first, Polygon only on DB miss = ~0 calls after daily cron runs
 
 async function getLivePrice(ticker) {
-  // Try Polygon — Options Advanced plan only:
-  //   v2/last/stocks  → live last trade price (market hours)
-  //   v2/aggs/prev    → previous close (24/7 fallback)
-  // NOTE: v2/snapshot/locale/us/markets/stocks is NOT in Options Advanced — always 403
-  if (POLYGON_KEY) {
+  // ── Step 1: Read prev-day close from DB
+  let prevClose = 0;
+  let prevFromDB = false;
+
+  const dbRow = await readDBDailyData(ticker);
+  if (dbRow && dbRow.prev_close) {
+    prevClose  = dbRow.prev_close ?? 0;
+    prevFromDB = true;
+    console.log(`[ghost-resolve.js] getLivePrice ${ticker}: prev-day from DB (${dbRow.computed_date}), prevClose=${prevClose}`);
+  }
+
+  // ── Step 2: If DB miss, fall back to /v2/aggs/prev
+  if (POLYGON_KEY && !prevFromDB) {
     try {
       let livePrice = 0;
       let liveVolume = 0;
 
-      // Live last trade (works during market hours)
-      const lastRes = await fetch(
-        `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`,
-        { headers: { 'User-Agent': 'Helios-Ghost/1.0' } }
-      );
+      // Try /v2/last/stocks first (market hours only)
+      const lastUrl = `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+      const lastRes = await fetch(lastUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
       if (lastRes.ok) {
-        const d = await lastRes.json();
-        livePrice = d?.results?.p ?? d?.last?.price ?? 0;
-      }
-
-      // Prev-day agg — always works, gives us prevClose + volume
-      const prevRes = await fetch(
-        `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`,
-        { headers: { 'User-Agent': 'Helios-Ghost/1.0' } }
-      );
-      if (prevRes.ok) {
-        const d = await prevRes.json();
-        const bar = d?.results?.[0];
-        if (bar) {
-          liveVolume = bar.v ?? 0;
-          if (!livePrice) livePrice = bar.c ?? 0;
+        const lastData = await lastRes.json();
+        livePrice = lastData?.results?.p ?? lastData?.last?.price ?? 0;
+        if (livePrice > 0) {
+          console.log(`[ghost-resolve.js] getLivePrice ${ticker}: live from /v2/last/stocks (DB miss), price=${livePrice}`);
+          return livePrice; // Live price found, skip /prev
         }
       }
 
-      if (livePrice) return { price: livePrice, volume: liveVolume, source: 'polygon' };
-    } catch (e) {
-      console.warn('[ghost-resolve] Polygon failed:', e.message);
+      // Fall back to /v2/aggs/prev for prev close
+      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
+      const prevRes = await fetch(prevUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
+      if (prevRes.ok) {
+        const prevData = await prevRes.json();
+        const bar = prevData?.results?.[0];
+        if (bar) {
+          prevClose = bar.c ?? 0;
+          console.log(`[ghost-resolve.js] getLivePrice ${ticker}: prev-day from Polygon (DB miss), prevClose=${prevClose}`);
+          return prevClose;
+        }
+      }
+    } catch (err) {
+      console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: Polygon failed — ${err.message}`);
     }
   }
 
-  // Yahoo Finance fallback
+  // ── Step 3: Yahoo fallback
   try {
-    const res = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1d`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios-Ghost/1.0)', Accept: 'application/json' } }
-    );
-    if (res.ok) {
-      const json = await res.json();
-      const meta = json?.chart?.result?.[0]?.meta;
-      if (meta?.regularMarketPrice) {
-        return {
-          price: meta.regularMarketPrice,
-          volume: meta.regularMarketVolume ?? 0,
-          source: 'yahoo',
-        };
+    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1m&range=1d`;
+    const yahooRes = await fetch(yahooUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)' },
+    });
+    if (yahooRes.ok) {
+      const yahooData = await yahooRes.json();
+      const meta = yahooData?.chart?.result?.[0]?.meta;
+      if (meta) {
+        const yahooPrice = meta.regularMarketPrice ?? meta.previousClose ?? 0;
+        console.log(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo fallback, price=${yahooPrice}`);
+        return yahooPrice;
       }
     }
-  } catch (e) {
-    console.warn('[ghost-resolve] Yahoo failed:', e.message);
+  } catch (yErr) {
+    console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo failed — ${yErr.message}`);
   }
 
-  return null;
+  // Final fallback: DB prev close or 0
+  console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: all sources failed, using prevClose=${prevClose}`);
+  return prevClose;
 }
 
-// ─── Supabase helpers (raw fetch — no SDK in cron context) ───────────────────
+// ─── Supabase helpers ─────────────────────────────────────────────────────────
 
-async function sbGet(path, params = {}) {
-  const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url.toString(), {
+async function sbFetch(table, filters = {}) {
+  const params = Object.entries(filters)
+    .map(([k, v]) => `${k}=eq.${encodeURIComponent(v)}`)
+    .join('&');
+  const url = `${SUPABASE_URL}/rest/v1/${table}${params ? '?' + params : ''}`;
+  const r = await fetch(url, {
     headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
     },
   });
-  if (!res.ok) throw new Error(`sbGet ${path} → ${res.status}`);
-  return res.json();
+  if (!r.ok) throw new Error(`sbFetch ${table} failed: ${r.status}`);
+  return r.json();
 }
 
-async function sbPatch(path, match, body) {
-  const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
-  for (const [k, v] of Object.entries(match)) url.searchParams.set(k, `eq.${v}`);
-  const res = await fetch(url.toString(), {
-    method: 'PATCH',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`sbPatch ${path} → ${res.status}`);
-}
-
-async function sbPost(path, body) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+async function sbPost(table, body) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}`;
+  const r = await fetch(url, {
     method: 'POST',
     headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
       'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Prefer': 'return=minimal',
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`sbPost ${path} → ${res.status}`);
+  if (!r.ok) throw new Error(`sbPost ${table} failed: ${r.status}`);
+  return true;
 }
 
-// ─── Session label from timestamp ────────────────────────────────────────────
-
-function sessionFromTimestamp(ts) {
-  const ct = new Date(new Date(ts).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  const total = ct.getHours() * 60 + ct.getMinutes();
-  if (total < 8 * 60 + 30) return 'premarket';
-  if (total < 9 * 60 + 45) return 'open';
-  if (total < 12 * 60) return 'midday';
-  if (total < 14 * 60) return 'afternoon';
-  if (total <= 15 * 60) return 'power_hour';
-  return 'afterhours';
+async function sbUpdate(table, filters, updates) {
+  const params = Object.entries(filters)
+    .map(([k, v]) => `${k}=eq.${encodeURIComponent(v)}`)
+    .join('&');
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${params}`;
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Prefer': 'return=minimal',
+    },
+    body: JSON.stringify(updates),
+  });
+  if (!r.ok) throw new Error(`sbUpdate ${table} failed: ${r.status}`);
+  return true;
 }
 
-// ─── Determine mistake type ───────────────────────────────────────────────────
+async function sbDelete(table, filters) {
+  const params = Object.entries(filters)
+    .map(([k, v]) => `${k}=eq.${encodeURIComponent(v)}`)
+    .join('&');
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${params}`;
+  const r = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+    },
+  });
+  if (!r.ok) throw new Error(`sbDelete ${table} failed: ${r.status}`);
+  return true;
+}
+
+// ─── Mistake classifier ───────────────────────────────────────────────────────
 
 function getMistakeType(call, movePct) {
-  if ((call.conviction ?? 0) >= 8 && Math.abs(movePct) > 1) return 'overconfident';
-  if (call.direction && Math.sign(movePct) !== 0) return 'direction_wrong';
-  if ((call.iv_rank ?? 0) > 70) return 'iv_mismatch';
-  return 'timing_off';
+  const expected = call.direction;
+  const actual = movePct > 0 ? 'BULLISH' : 'BEARISH';
+  if (expected === actual) return 'early_exit';
+  return Math.abs(movePct) < 0.5 ? 'flat_chop' : 'wrong_direction';
 }
 
-function buildLearnedNote(call, mistakeType) {
-  switch (mistakeType) {
-    case 'overconfident':
-      return `Reduce conviction when ${call.pattern || 'this setup'} appears${call.session ? ` in ${call.session}` : ''}. High confidence called but direction was wrong — recalibrate.`;
-    case 'direction_wrong':
-      return `${call.pattern || call.source} setup predicted ${call.direction} incorrectly. Review confluence conditions before committing to direction.`;
-    case 'iv_mismatch':
-      return `IV Rank ${call.iv_rank?.toFixed?.(0) ?? '?'} may have suppressed the expected move. High IV environments distort directional plays.`;
-    case 'timing_off':
-      return `${call.session ? `${call.session} session` : 'Timing'} was not optimal for this play. Consider session-specific filters.`;
-    default:
-      return 'Review setup conditions and adjust analysis weight.';
-  }
-}
-
-// ─── Update daily accuracy snapshot ──────────────────────────────────────────
-
-async function updateSnapshot(source, outcome, conviction, movePct, calibration) {
-  const today = new Date().toISOString().split('T')[0];
-
-  let existing = null;
-  try {
-    const rows = await sbGet('ghost_accuracy_snapshots', {
-      snapshot_date: `eq.${today}`,
-      source: `eq.${source}`,
-      select: '*',
-      limit: '1',
-    });
-    existing = rows?.[0] ?? null;
-  } catch { /* first entry */ }
-
-  const totalCalls = (existing?.total_calls ?? 0) + 1;
-  const wins = (existing?.wins ?? 0) + (outcome === 'win' ? 1 : 0);
-  const losses = (existing?.losses ?? 0) + (outcome === 'loss' ? 1 : 0);
-  const scratches = (existing?.scratches ?? 0) + (outcome === 'scratch' ? 1 : 0);
-  const winRate = Math.round((wins / totalCalls) * 100);
-
-  const avgConviction = conviction != null
-    ? ((existing?.avg_conviction ?? 0) * (totalCalls - 1) + conviction) / totalCalls
-    : existing?.avg_conviction ?? 0;
-
-  const avgMove = ((existing?.avg_actual_move ?? 0) * (totalCalls - 1) + movePct) / totalCalls;
-  const avgCal = calibration != null
-    ? ((existing?.calibration_score ?? 0) * (totalCalls - 1) + calibration) / totalCalls
-    : existing?.calibration_score ?? 0;
-
-  const payload = {
-    snapshot_date: today,
-    source,
-    total_calls: totalCalls,
-    wins, losses, scratches,
-    win_rate: winRate,
-    avg_conviction: Math.round(avgConviction * 10) / 10,
-    avg_actual_move: Math.round(avgMove * 100) / 100,
-    calibration_score: Math.round(avgCal * 100) / 100,
+function buildLearnedNote(call, mistake) {
+  const base = {
+    early_exit: 'Held thesis but exited before move completed',
+    flat_chop: 'Market went nowhere — avoid low-volume or consolidation setups',
+    wrong_direction: 'Directional thesis was wrong — recheck bias/momentum signals',
   };
+  return base[mistake] ?? 'Review setup and signal strength';
+}
 
-  if (existing) {
-    await sbPatch('ghost_accuracy_snapshots', { snapshot_date: today, source }, payload);
-  } else {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/ghost_accuracy_snapshots`, {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates,return=minimal',
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`snapshot upsert → ${res.status}`);
+// ─── Session snapshot updater ─────────────────────────────────────────────────
+
+async function updateSnapshot(source, outcome, conviction, movePct, confidenceVsReality) {
+  try {
+    const existing = await sbFetch('ghost_session_digest', { source });
+    if (existing.length === 0) {
+      await sbPost('ghost_session_digest', {
+        source,
+        total_calls: 1,
+        win: outcome === 'win' ? 1 : 0,
+        loss: outcome === 'loss' ? 1 : 0,
+        avg_conviction: conviction ?? 0,
+        avg_move_pct: movePct,
+        confidence_vs_reality: confidenceVsReality,
+        last_updated: new Date().toISOString(),
+      });
+    } else {
+      const snap = existing[0];
+      const newTotal = snap.total_calls + 1;
+      const newWin = snap.win + (outcome === 'win' ? 1 : 0);
+      const newLoss = snap.loss + (outcome === 'loss' ? 1 : 0);
+      const newAvgConv = ((snap.avg_conviction * snap.total_calls) + (conviction ?? 0)) / newTotal;
+      const newAvgMove = ((snap.avg_move_pct * snap.total_calls) + movePct) / newTotal;
+      const newConfVsReal = ((snap.confidence_vs_reality * snap.total_calls) + confidenceVsReality) / newTotal;
+      await sbUpdate('ghost_session_digest', { source }, {
+        total_calls: newTotal,
+        win: newWin,
+        loss: newLoss,
+        avg_conviction: parseFloat(newAvgConv.toFixed(2)),
+        avg_move_pct: parseFloat(newAvgMove.toFixed(2)),
+        confidence_vs_reality: parseFloat(newConfVsReal.toFixed(2)),
+        last_updated: new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    console.warn('[ghost-resolve] updateSnapshot error:', err.message);
   }
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Auth check
-  const authHeader = req.headers.authorization ?? '';
-  const secret = authHeader.replace('Bearer ', '');
-  if (CRON_SECRET && secret !== CRON_SECRET) {
+  const isVercelCron = req.headers['x-vercel-cron'] === '1';
+  const secret = req.query.secret ?? req.headers['x-cron-secret'];
+  if (!isVercelCron && secret !== CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  if (!isMarketHours()) {
-    return res.status(200).json({ ok: true, skipped: 0, resolved: 0, reason: 'outside market hours' });
-  }
-
   if (!SUPABASE_URL || !SUPABASE_KEY) {
-    return res.status(500).json({ error: 'Missing Supabase config' });
+    return res.status(500).json({ error: 'Supabase not configured' });
   }
 
   const startTime = Date.now();
@@ -250,69 +268,87 @@ module.exports = async function handler(req, res) {
   const log = [];
 
   try {
-    // Fetch all pending ghost calls older than 15 min
-    const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    const calls = await sbGet('ghost_calls', {
-      status: 'eq.pending',
-      created_at: `lt.${cutoff}`,
-      select: '*',
-      order: 'created_at.asc',
-      limit: '50',
-    });
+    // Fetch all pending calls
+    const calls = await sbFetch('ghost_calls');
+    const pending = calls.filter(c => c.status === 'pending');
+    console.log(`[ghost-resolve] Found ${pending.length} pending calls`);
 
-    for (const call of calls) {
+    for (const call of pending) {
       try {
-        // Dead letter after 3 attempts
-        const attempts = (call.resolve_attempts ?? 0) + 1;
-        if (attempts > 3) {
-          await sbPatch('ghost_calls', { id: call.id }, { status: 'dead_letter', resolve_attempts: attempts });
+        // Guard 1: Dead letter queue
+        const attempts = call.resolve_attempts ?? 0;
+        if (attempts >= 3) {
+          await sbUpdate('ghost_calls', { id: call.id }, { status: 'dead_letter' });
           deadLettered++;
-          log.push(`DEAD ${call.ticker} (${attempts} attempts)`);
+          log.push(`DEAD ${call.ticker} (3 failed attempts)`);
           continue;
         }
 
-        await sbPatch('ghost_calls', { id: call.id }, { resolve_attempts: attempts });
+        // Increment resolve attempts
+        await sbUpdate('ghost_calls', { id: call.id }, { resolve_attempts: attempts + 1 });
 
-        const priceData = await getLivePrice(call.ticker);
-        if (!priceData?.price) {
+        // Guard 3: Minimum hold time (15 min)
+        const age = Date.now() - new Date(call.logged_at).getTime();
+        if (age < 15 * 60 * 1000) {
           skipped++;
-          log.push(`SKIP ${call.ticker} — no price`);
           continue;
         }
 
-        const currentPrice = priceData.price;
-        const entryPrice   = call.entry_price ?? call.price ?? 0;
-        if (!entryPrice) {
+        // Guard 4: Market hours only
+        if (!isMarketHours()) {
           skipped++;
-          log.push(`SKIP ${call.ticker} — no entry price`);
           continue;
         }
 
-        const movePct  = ((currentPrice - entryPrice) / entryPrice) * 100;
-        const absMov   = Math.abs(movePct);
-        const isUp     = movePct > 0;
-        const isCall   = call.direction === 'calls' || call.direction === 'up' || call.direction === 'bullish';
-        const isPut    = call.direction === 'puts'  || call.direction === 'down' || call.direction === 'bearish';
-
-        let outcome = 'scratch';
-        if (absMov >= 1.0) {
-          if ((isCall && isUp) || (isPut && !isUp)) outcome = 'win';
-          else outcome = 'loss';
+        // Fetch live price
+        const currentPrice = await getLivePrice(call.ticker);
+        if (!currentPrice || currentPrice === 0) {
+          skipped++;
+          log.push(`SKIP ${call.ticker} (no price)`);
+          continue;
         }
 
-        const confidenceVsReality = call.conviction != null
-          ? Math.round(((call.conviction / 10) - (outcome === 'win' ? 1 : outcome === 'loss' ? 0 : 0.5)) * 100)
-          : null;
+        const entryPrice = call.entry_price ?? 0;
+        if (entryPrice === 0) {
+          skipped++;
+          log.push(`SKIP ${call.ticker} (no entry price)`);
+          continue;
+        }
 
-        const session = sessionFromTimestamp(call.created_at);
+        // Guard 2: Price confidence (skip if price delta > 5% within 2hr window)
+        if (age < 2 * 60 * 60 * 1000) {
+          const priceDelta = Math.abs((currentPrice - entryPrice) / entryPrice);
+          if (priceDelta > 0.05) {
+            skipped++;
+            log.push(`SKIP ${call.ticker} (price jump ${(priceDelta * 100).toFixed(1)}%)`);
+            continue;
+          }
+        }
 
-        await sbPatch('ghost_calls', { id: call.id }, {
+        // Compute move
+        const movePct = ((currentPrice - entryPrice) / entryPrice) * 100;
+        const absMov = Math.abs(movePct);
+        const expected = call.direction === 'BULLISH' ? 1 : -1;
+        const actual = movePct > 0 ? 1 : -1;
+        const outcome = (expected === actual && absMov >= 0.3) ? 'win' : 'loss';
+
+        // Confidence vs reality — how well conviction matched outcome
+        const convictionScore = (call.conviction ?? 5) / 10; // 0–1
+        const outcomeScore = outcome === 'win' ? 1 : 0;
+        const confidenceVsReality = Math.abs(convictionScore - outcomeScore);
+
+        // Guard 6: Confidence decay
+        const ageInDays = age / (24 * 60 * 60 * 1000);
+        const weight = ageInDays > 30 ? 0.5 : 1.0;
+
+        // Mark resolved
+        await sbUpdate('ghost_calls', { id: call.id }, {
           status: 'resolved',
           outcome,
           exit_price: currentPrice,
-          actual_move_pct: Math.round(movePct * 100) / 100,
+          move_pct: parseFloat(movePct.toFixed(2)),
           resolved_at: new Date().toISOString(),
-          session: call.session ?? session,
+          weight,
         });
 
         // Correction log for high-conviction losses
