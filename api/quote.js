@@ -8,552 +8,420 @@ const VIX_SYMBOLS     = new Set(['VIX', '^VIX', 'I:VIX']);
 const INDEX_TICKER_MAP = { SPX: 'I:SPX', NDX: 'I:NDX', SPXW: 'I:SPX' };
 
 function isVixTicker(ticker) {
-  return VIX_SYMBOLS.has(ticker.toUpperCase());
+  return VIX_SYMBOLS.has(ticker?.toUpperCase?.());
 }
 
-function toPolygonAggTicker(ticker) {
-  const up = ticker.toUpperCase();
-  if (up.startsWith('^')) return up.replace('^', 'I:');
-  return INDEX_TICKER_MAP[up] ?? up;
+function normalizeSymbol(symbol) {
+  if (!symbol) return 'SPY';
+  const upper = symbol.toUpperCase().trim();
+  return INDEX_TICKER_MAP[upper] || upper;
 }
 
-// ── DB helpers ───────────────────────────────────────────────────────────────
+function isIndex(symbol) {
+  const norm = normalizeSymbol(symbol);
+  return norm.startsWith('I:');
+}
 
+function toPolygonAggTicker(symbol) {
+  const norm = normalizeSymbol(symbol);
+  if (norm.startsWith('I:')) return norm;
+  return symbol.toUpperCase();
+}
+
+// ── Yahoo Finance fallback ───────────────────────────────────────────────────
+async function fetchYahooQuote(symbol) {
+  const sym = symbol.toUpperCase();
+  const yahooSym = sym === 'SPX' || sym === 'SPXW' ? '^GSPC' : (sym === 'VIX' ? '^VIX' : sym);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1d&range=5d`;
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Helios-quote/3.0' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) throw new Error(`Yahoo HTTP ${r.status}`);
+    const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error('No Yahoo result');
+    const meta  = result.meta;
+    const price = meta.regularMarketPrice ?? 0;
+    const prev  = meta.chartPreviousClose ?? price;
+    const change = price - prev;
+    const changePct = prev !== 0 ? (change / prev) * 100 : 0;
+    return {
+      symbol:    sym,
+      price:     price,
+      change:    change,
+      changePct: changePct,
+      high:      meta.regularMarketDayHigh  || price,
+      low:       meta.regularMarketDayLow   || price,
+      open:      meta.regularMarketOpen     || price,
+      prevClose: prev,
+      volume:    meta.regularMarketVolume   || 0,
+      source:    'yahoo-finance',
+    };
+  } catch (e) {
+    throw new Error(`Yahoo fetch failed: ${e.message}`);
+  }
+}
+
+// ── DB-first paths (daily_market_data) ───────────────────────────────────────
 async function readDBDailyData(symbol) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return null;
   try {
-    // IMPORTANT: sort by computed_date (the actual column — there is no 'date' column)
-    const url = `${SUPABASE_URL}/rest/v1/daily_market_data?symbol=eq.${encodeURIComponent(symbol)}&order=computed_date.desc&limit=1&select=*`;
+    const url = `${SUPABASE_URL}/rest/v1/daily_market_data?symbol=eq.${encodeURIComponent(symbol.toUpperCase())}&select=*&order=computed_date.desc&limit=1`;
     const r = await fetch(url, {
       headers: {
-        'apikey':         SUPABASE_KEY,
+        'apikey':        SUPABASE_KEY,
         'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type':  'application/json',
       },
+      signal: AbortSignal.timeout(5000),
     });
     if (!r.ok) return null;
     const rows = await r.json();
-    if (!Array.isArray(rows) || rows.length === 0) return null;
-    const row = rows[0];
-    // Reject if data is older than 7 days (use computed_date — the only date column on this table)
-    const rowDate = new Date(row.computed_date + 'T00:00:00');
-    const ageMs   = Date.now() - rowDate.getTime();
-    if (ageMs > 7 * 24 * 60 * 60 * 1000) {
-      console.warn(`[quote.js] DB daily_market_data stale for ${symbol} (${row.computed_date}) — falling back to Polygon`);
-      return null;
-    }
-    return row;
-  } catch {
+    return rows?.[0] || null;
+  } catch (e) {
+    console.warn(`[quote.js] readDBDailyData(${symbol}) failed: ${e.message}`);
     return null;
   }
 }
 
-// ── Yahoo Finance helpers ────────────────────────────────────────────────────
+// ── Polygon: spot price (last trade or prev close from /v2/aggs/prev) ───────
+async function fetchPolygonSpot(symbol) {
+  if (!POLYGON_KEY) return null;
+  const norm = normalizeSymbol(symbol);
 
-async function fetchYahooQuote(ticker) {
-  const yahooTicker = ticker === 'SPX'  ? '^GSPC'
-    : ticker === 'NDX'                  ? '^NDX'
-    : ticker === 'VIX' || ticker === '^VIX' || ticker === 'I:VIX' ? '^VIX'
-    : ticker.startsWith('I:')           ? '^' + ticker.slice(2)
-    : ticker;
+  // RULE 1: VIX always uses Yahoo (Polygon I:VIX → 403)
+  if (isVixTicker(symbol)) {
+    try {
+      const q = await fetchYahooQuote('VIX');
+      return {
+        price:     q.price,
+        prevClose: q.prevClose,
+        high:      q.high,
+        low:       q.low,
+        open:      q.open,
+        volume:    q.volume,
+        vwap:      null,
+        liveSize:  null,
+        liveTime:  null,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooTicker)}?interval=1m&range=1d`;
-  const r   = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)', Accept: 'application/json' },
-  });
-  if (!r.ok) throw new Error(`Yahoo ${r.status}`);
-  const json = await r.json();
-  const meta = json?.chart?.result?.[0]?.meta;
-  if (!meta) throw new Error('No Yahoo meta');
+  // SPX → Yahoo (Polygon I:SPX daily bars 403 on Options Advanced)
+  if (norm === 'I:SPX') {
+    try {
+      const q = await fetchYahooQuote('SPX');
+      return {
+        price:     q.price,
+        prevClose: q.prevClose,
+        high:      q.high,
+        low:       q.low,
+        open:      q.open,
+        volume:    q.volume,
+        vwap:      null,
+        liveSize:  null,
+        liveTime:  null,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
 
-  const price     = meta.regularMarketPrice ?? meta.previousClose ?? 0;
-  const prevClose = meta.previousClose ?? meta.chartPreviousClose ?? price;
-  const change    = price - prevClose;
-  const changePct = prevClose ? (change / prevClose) * 100 : 0;
+  // DB-first prev-day data (prevClose, prevHigh, prevLow)
+  const dbRow = await readDBDailyData(symbol);
+  const prevClose = dbRow?.prev_close ?? null;
+  const prevHigh  = dbRow?.prev_high  ?? null;
+  const prevLow   = dbRow?.prev_low   ?? null;
 
-  return {
-    price,
-    prevClose,
-    change,
-    changePct,
-    high:   meta.regularMarketDayHigh ?? price,
-    low:    meta.regularMarketDayLow  ?? price,
-    open:   meta.regularMarketOpen    ?? prevClose,
-    volume: meta.regularMarketVolume  ?? 0,
-    vwap:   null,
-    source: 'yahoo',
-  };
+  try {
+    let livePrice = null;
+    let liveSize  = null;
+    let liveTime  = null;
+
+    // RULE 5: Index → /v2/last/trade/I:XXX, Equity → /v2/last/stocks/{ticker}
+    const endpoint = isIndex(norm)
+      ? `https://api.polygon.io/v2/last/trade/${encodeURIComponent(norm)}?apiKey=${POLYGON_KEY}`
+      : `https://api.polygon.io/v2/last/trade/${encodeURIComponent(norm)}?apiKey=${POLYGON_KEY}`;
+
+    const r = await fetch(endpoint, {
+      headers: { 'User-Agent': 'Helios/3.0' },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (r.ok) {
+      const data = await r.json();
+      const last = data?.results;
+      if (last?.p) {
+        livePrice = last.p;
+        liveSize  = last.s || null;
+        liveTime  = last.t || null;
+      }
+    }
+
+    // If no live tick, use prevClose from DB (if available)
+    const finalPrice = livePrice ?? prevClose;
+    if (!finalPrice) return null;
+
+    return {
+      price:     finalPrice,
+      prevClose: prevClose,
+      prevHigh:  prevHigh,
+      prevLow:   prevLow,
+      high:      null,
+      low:       null,
+      open:      null,
+      volume:    null,
+      vwap:      null,
+      liveSize:  liveSize,
+      liveTime:  liveTime,
+    };
+  } catch (e) {
+    console.warn(`[quote.js] fetchPolygonSpot(${symbol}) error: ${e.message}`);
+    return null;
+  }
 }
 
-// ── Polygon spot price (stocks + non-VIX indices) ────────────────────────────
-//
-// RATE LIMIT ARCHITECTURE — permanent fix:
-//   BEFORE: 2 Polygon calls per quote (prev-day agg + live last-trade)
-//   AFTER:  1 Polygon call per quote (live last-trade only)
-//   Prev-day fields come from DB (daily-data-cron writes them at 4:05 PM CT).
-//   /v2/aggs/prev only fires if DB has no prev data (first-run / stale DB).
-//
-async function fetchPolygonSpot(ticker) {
-  const aggTicker = toPolygonAggTicker(ticker);
-  const sym       = ticker.toUpperCase();
+// ── Type handlers ────────────────────────────────────────────────────────────
 
-  // isIndex must be declared FIRST — it is used in Step 2 (DB-miss /prev fallback gate)
-  // and Step 3 (live price routing). Declaring it here prevents the TDZ ReferenceError
-  // that would otherwise throw on every equity DB-miss call.
-  const isIndex = !!INDEX_TICKER_MAP[sym];
+async function handleCandles(req, res, sym, multiplier, timespan) {
+  if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, results: [], error: 'No Polygon key' });
+  try {
+    const norm = normalizeSymbol(sym);
+    const aggTicker = norm.startsWith('I:') ? norm : sym.toUpperCase();
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/range/${multiplier}/${timespan}?adjusted=true&sort=desc&limit=90&apiKey=${POLYGON_KEY}`;
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Helios/3.0' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return res.status(200).json({ symbol: sym, results: [], error: `Polygon HTTP ${r.status}` });
+    const data = await r.json();
+    return res.status(200).json({
+      symbol: sym,
+      results: data.results || [],
+      count:   data.resultsCount || 0,
+      source:  'polygon',
+    });
+  } catch (e) {
+    return res.status(200).json({ symbol: sym, results: [], error: e.message || 'Candle fetch failed' });
+  }
+}
 
-  // ── Step 1: Read prev-day fields from DB
-  let prevClose = 0, prevVwap = 0, prevHigh = 0, prevLow = 0, prevOpen = 0, prevVol = 0;
-  let prevFromDB = false;
+async function handleCandlesFormatted(req, res, sym, multiplier, timespan, limit = 90) {
+  if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, bars: [], error: 'No Polygon key' });
+  try {
+    const norm = normalizeSymbol(sym);
+    const aggTicker = norm.startsWith('I:') ? norm : sym.toUpperCase();
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/range/${multiplier}/${timespan}?adjusted=true&sort=desc&limit=${limit}&apiKey=${POLYGON_KEY}`;
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Helios/3.0' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return res.status(200).json({ symbol: sym, bars: [], error: `Polygon HTTP ${r.status}` });
+    const data = await r.json();
+    const results = data.results || [];
+    const bars = results.map(b => ({
+      time:   b.t,
+      open:   b.o,
+      high:   b.h,
+      low:    b.l,
+      close:  b.c,
+      volume: b.v || 0,
+      vwap:   b.vw || null,
+    }));
+    return res.status(200).json({
+      symbol: sym,
+      bars,
+      count:  bars.length,
+      source: 'polygon',
+    });
+  } catch (e) {
+    return res.status(200).json({ symbol: sym, bars: [], error: e.message || 'Candle fetch failed' });
+  }
+}
 
+async function handleAgg(req, res, sym) {
+  const isBacktest = req.query.backtest === 'true';
+
+  // DB-first path: if ADV exists in daily_market_data, return it immediately (unless backtest mode)
+  if (!isBacktest) {
+    const dbRow = await readDBDailyData(sym);
+    if (dbRow?.adv != null) {
+      return res.status(200).json({ symbol: sym, avgDailyVolume: dbRow.adv, bars: 0, source: 'db' });
+    }
+  }
+
+  // Fallback: call Polygon (or return raw bar array for backtest)
+  if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, avgDailyVolume: 0, error: 'No Polygon key' });
+  console.log(`[quote.js] ADV for ${sym} — ${isBacktest ? 'backtest mode (raw bars)' : 'DB miss'}, calling Polygon`);
+  try {
+    const aggTicker  = toPolygonAggTicker(sym);
+    const multiplier = req.query.multiplier ?? 1;
+    const timespan   = req.query.timespan   ?? 'day';
+    // Respect caller's from/to when provided (backtest needs multi-year range).
+    // Default to last 30 days for ADV-only callers.
+    const defaultTo   = new Date();
+    const defaultFrom = new Date(defaultTo.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const fromStr = req.query.from || defaultFrom.toISOString().split('T')[0];
+    const toStr   = req.query.to   || defaultTo.toISOString().split('T')[0];
+    // Backtest can request up to 5 years × 252 bars; cap limit at 1500 to match cron
+    const limit = isBacktest ? 1500 : 50;
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/range/${multiplier}/${timespan}/${fromStr}/${toStr}?adjusted=true&sort=asc&limit=${limit}&apiKey=${POLYGON_KEY}`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
+    if (!r.ok) return res.status(200).json({ symbol: sym, avgDailyVolume: 0, results: [], error: `Polygon ${r.status}` });
+    const data = await r.json();
+    const bars = data.results ?? [];
+    if (isBacktest) {
+      return res.status(200).json({ symbol: sym, results: bars, count: bars.length, source: 'polygon' });
+    }
+    const volumes        = bars.map(b => b.v || 0);
+    const avgDailyVolume = volumes.length > 0 ? Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length) : 0;
+    return res.status(200).json({ symbol: sym, avgDailyVolume, bars: bars.length, source: 'polygon-fallback' });
+  } catch (e) {
+    return res.status(200).json({ symbol: sym, avgDailyVolume: 0, results: [], error: e.message || 'ADV failed' });
+  }
+}
+
+async function handleHV(req, res, sym) {
+  // DB-first: if HV exists in daily_market_data, return it immediately
   const dbRow = await readDBDailyData(sym);
-  if (dbRow && dbRow.prev_close) {
-    prevClose  = dbRow.prev_close  ?? 0;
-    prevHigh   = dbRow.prev_high   ?? 0;
-    prevLow    = dbRow.prev_low    ?? 0;
-    prevOpen   = dbRow.prev_open   ?? 0;
-    prevVwap   = dbRow.prev_vwap   ?? 0;
-    prevVol    = dbRow.prev_volume ?? 0;
-    prevFromDB = true;
-    console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from DB (${dbRow.computed_date}), prevClose=${prevClose}`);
+  if (dbRow?.hv20 != null) {
+    return res.status(200).json({
+      symbol: sym,
+      hv10:   dbRow.hv10   ?? null,
+      hv20:   dbRow.hv20   ?? null,
+      hv60:   dbRow.hv60   ?? null,
+      hv252:  dbRow.hv252  ?? null,
+      source: 'db',
+    });
   }
 
-  // ── Step 2: If DB miss, fall back to /v2/aggs/prev
-  // INDEX EXCEPTION: /v2/aggs/ticker/I:SPX/prev → 403 on Options Advanced plan.
-  // For index tickers, skip Polygon /prev entirely — prevClose comes from Yahoo in Step 3.
-  if (!prevFromDB && !isIndex) {
-    try {
-      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
-      const prevR   = await fetch(prevUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
-      if (prevR.ok) {
-        const d   = await prevR.json();
-        const bar = d?.results?.[0];
-        if (bar) {
-          prevClose = bar.c  ?? 0;
-          prevVwap  = bar.vw ?? 0;
-          prevHigh  = bar.h  ?? 0;
-          prevLow   = bar.l  ?? 0;
-          prevOpen  = bar.o  ?? 0;
-          prevVol   = bar.v  ?? 0;
-          console.log(`[quote.js] fetchPolygonSpot ${ticker}: prev-day from Polygon (DB miss), prevClose=${prevClose}`);
-        }
-      }
-    } catch { /* non-blocking */ }
-  }
-
-  // ── Step 3: Live price
-  // RULE: Index tickers (SPX, NDX) → Yahoo Finance. /v2/last/trade/I:* returns 403 on Options Advanced plan.
-  // Equity tickers → /v2/last/stocks/{ticker} (works fine)
-  let livePrice = 0, liveTime = null, liveSize = null;
-
-  if (isIndex) {
-    // Index: use Yahoo Finance — never hits Polygon index endpoint
-    try {
-      const yahooTicker = ticker.toUpperCase() === 'SPX' || ticker.toUpperCase() === 'SPXW' ? '^GSPC'
-        : ticker.toUpperCase() === 'NDX' ? '^NDX'
-        : '^' + ticker.replace(/^I:/, '');
-      const yq = await fetchYahooQuote(yahooTicker);
-      if (yq && yq.price > 0) {
-        livePrice = yq.price;
-        // If DB missed, fill prev-day fields from Yahoo — avoids dead /v2/aggs/prev call
-        if (!prevFromDB) {
-          if (yq.prevClose > 0) prevClose = yq.prevClose;
-          if (yq.high > 0)      prevHigh  = yq.high;
-          if (yq.low > 0)       prevLow   = yq.low;
-          if (yq.open > 0)      prevOpen  = yq.open;
-        }
-      }
-    } catch { /* fall back to prevClose */ }
-    console.log(`[quote.js] fetchPolygonSpot ${ticker} (index→Yahoo): live=${livePrice}, prevClose=${prevClose}`);
-  } else {
-    // Equity: standard /v2/last/stocks endpoint
-    try {
-      const lastUrl = `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
-      const lastR = await fetch(lastUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
-      if (lastR.ok) {
-        const ld  = await lastR.json();
-        livePrice = ld?.results?.p ?? ld?.last?.price     ?? 0;
-        liveTime  = ld?.results?.t ?? ld?.last?.timestamp ?? null;
-        liveSize  = ld?.results?.s ?? ld?.last?.size      ?? null;
-      }
-    } catch { /* non-blocking */ }
-    console.log(`[quote.js] fetchPolygonSpot ${ticker}: live=${livePrice}, prevClose=${prevClose}, prevSrc=${prevFromDB ? 'db' : 'polygon'}`);
-  }
-
-  const price = livePrice > 0 ? livePrice : prevClose;
-
-  return { price, prevClose, vwap: prevVwap, high: prevHigh, low: prevLow, open: prevOpen, volume: prevVol, liveTime, liveSize };
+  // DB miss — return empty (client should never hit this after cron runs)
+  console.warn(`[quote.js] HV DB miss for ${sym} — cron hasn't populated daily_market_data yet`);
+  return res.status(200).json({
+    symbol: sym,
+    hv10:   null,
+    hv20:   null,
+    hv60:   null,
+    hv252:  null,
+    source: 'db-miss',
+  });
 }
 
-// ── Candle fetch helper ───────────────────────────────────────────────────────
-// Returns bars in the normalised shape { time, open, high, low, close, volume, vwap }
-// that centralDataStore._fetchCandles1m() / 15m expect.
+async function handleOptions(req, res, sym) {
+  if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, error: 'No Polygon key' });
+  try {
+    const norm = normalizeSymbol(sym);
+    const ticker = norm.startsWith('I:') ? norm : sym.toUpperCase();
+    const snapshotUrl = `https://api.polygon.io/v3/snapshot/options/${encodeURIComponent(ticker)}?limit=250&apiKey=${POLYGON_KEY}`;
+    const r = await fetch(snapshotUrl, {
+      headers: { 'User-Agent': 'Helios/3.0' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return res.status(200).json({ symbol: sym, error: `Polygon ${r.status}` });
+    const data = await r.json();
+    const results = data.results || [];
+    if (results.length === 0) return res.status(200).json({ symbol: sym, error: 'No options data' });
 
-async function fetchCandleBars(sym, multiplier, timespan, fromMs, toMs, limit) {
-  const aggTicker = toPolygonAggTicker(sym);
-  const fromDate  = new Date(fromMs).toISOString().split('T')[0];
-  const toDate    = new Date(toMs).toISOString().split('T')[0];
-  const url       = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/range/${multiplier}/${timespan}/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=${limit}&apiKey=${POLYGON_KEY}`;
-  const r = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
-  if (!r.ok) throw new Error(`Polygon ${r.status}`);
-  const data     = await r.json();
-  const rawBars  = data.results ?? [];
-  const bars     = rawBars.map(b => ({
-    time:   b.t,
-    open:   b.o,
-    high:   b.h,
-    low:    b.l,
-    close:  b.c,
-    volume: b.v,
-    vwap:   b.vw ?? 0,
-  }));
-  return bars;
+    const atmCall = results
+      .filter(c => c.details?.contract_type === 'call' && c.greeks?.delta)
+      .sort((a, b) => Math.abs(a.greeks.delta - 0.5) - Math.abs(b.greeks.delta - 0.5))[0];
+
+    const atmPut = results
+      .filter(c => c.details?.contract_type === 'put' && c.greeks?.delta)
+      .sort((a, b) => Math.abs(a.greeks.delta + 0.5) - Math.abs(b.greeks.delta + 0.5))[0];
+
+    const calls = results.filter(c => c.details?.contract_type === 'call');
+    const puts  = results.filter(c => c.details?.contract_type === 'put');
+    const totalCallVol = calls.reduce((sum, c) => sum + (c.day?.volume || 0), 0);
+    const totalPutVol  = puts.reduce((sum, c) => sum + (c.day?.volume || 0), 0);
+    const pcRatio = totalCallVol > 0 ? totalPutVol / totalCallVol : null;
+
+    const atmIV = atmCall?.implied_volatility || atmPut?.implied_volatility || null;
+
+    return res.status(200).json({
+      symbol: sym,
+      atmIV,
+      atmCallDelta: atmCall?.greeks?.delta || null,
+      atmPutDelta:  atmPut?.greeks?.delta  || null,
+      atmCallGamma: atmCall?.greeks?.gamma || null,
+      atmPutGamma:  atmPut?.greeks?.gamma  || null,
+      pcRatio,
+      source: 'polygon',
+    });
+  } catch (e) {
+    return res.status(200).json({ symbol: sym, error: e.message || 'Options fetch failed' });
+  }
+}
+
+async function handleValidateContract(req, res, sym, expiry, strike, optionType) {
+  try {
+    const yahooSym = sym.toUpperCase();
+    const expiryStr = expiry.replace(/-/g, '');
+    const strikeInt = Math.round(parseFloat(strike) * 1000);
+    const contractSuffix = `${expiryStr}${optionType === 'call' ? 'C' : 'P'}${String(strikeInt).padStart(8, '0')}`;
+    const contractSymbol = `${yahooSym}${contractSuffix}`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${contractSymbol}?interval=1d&range=1d`;
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Helios-ValidateContract/3.0' },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!r.ok) {
+      return res.status(200).json({ exists: false, contractSymbol, error: `Yahoo HTTP ${r.status}` });
+    }
+    const data = await r.json();
+    const hasData = data?.chart?.result?.[0]?.meta?.regularMarketPrice != null;
+    return res.status(200).json({ exists: hasData, contractSymbol, source: 'yahoo' });
+  } catch (e) {
+    return res.status(200).json({ exists: false, error: e.message || 'Validation timeout' });
+  }
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
-
-module.exports = async function handler(req, res) {
+module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { symbol, type } = req.query;
-  if (!symbol) return res.status(400).json({ error: 'symbol required' });
-  const sym = symbol.toUpperCase().trim();
+  const sym  = req.query.symbol || 'SPY';
+  const type = req.query.type   || 'quote';
 
-  // ── RULE 1: VIX → always Yahoo, no Polygon path ─────────────────────────────
-  if (isVixTicker(sym) && !type) {
-    try {
-      const q = await fetchYahooQuote(sym);
-      return res.status(200).json({
-        symbol:    'VIX',
-        price:     q.price,
-        change:    q.change,
-        changePct: q.changePct,
-        high:      q.high,
-        low:       q.low,
-        open:      q.open,
-        prevClose: q.prevClose,
-        volume:    q.volume,
-        vwap:      null,
-        bid:       null,
-        ask:       null,
-        source:    'yahoo-vix',
-      });
-    } catch (e) {
-      return res.status(200).json({ symbol: 'VIX', price: 0, error: e.message, source: 'yahoo-vix-failed' });
-    }
-  }
-
-  // ── Type: candles (legacy — 1-min bars, raw results[] shape) ─────────────────
   if (type === 'candles') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, results: [], error: 'No Polygon key' });
-    try {
-      const now  = Date.now();
-      const bars = await fetchCandleBars(sym, 1, 'minute', now - 90 * 60 * 1000, now, 120);
-      // Legacy shape: results[] with raw polygon field names
-      const results = bars.map(b => ({ t: b.time, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume, vw: b.vwap }));
-      return res.status(200).json({ symbol: sym, results, count: results.length, source: 'polygon' });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, results: [], error: e.message || 'Candles failed' });
-    }
+    return handleCandles(req, res, sym, 1, 'minute');
   }
-
-  // ── Type: candles1m (1-min bars — bars[] shape for centralDataStore) ──────────
   if (type === 'candles1m') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, bars: [], error: 'No Polygon key' });
-    try {
-      const now  = Date.now();
-      const bars = await fetchCandleBars(sym, 1, 'minute', now - 90 * 60 * 1000, now, 120);
-      return res.status(200).json({ symbol: sym, bars, count: bars.length, source: 'polygon' });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, bars: [], error: e.message || 'Candles1m failed' });
-    }
+    return handleCandlesFormatted(req, res, sym, 1, 'minute', 90);
   }
-
-  // ── Type: candles5m (5-min bars — bars[] shape for centralDataStore) ──────────
   if (type === 'candles5m') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, bars: [], error: 'No Polygon key' });
-    try {
-      const now  = Date.now();
-      const bars = await fetchCandleBars(sym, 5, 'minute', now - 8 * 60 * 60 * 1000, now, 120);
-      return res.status(200).json({ symbol: sym, bars, count: bars.length, source: 'polygon' });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, bars: [], error: e.message || 'Candles5m failed' });
-    }
+    return handleCandlesFormatted(req, res, sym, 5, 'minute', 96);
   }
-
-  // ── Type: candles15m (15-min bars — bars[] shape for centralDataStore) ─────────
   if (type === 'candles15m') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, bars: [], error: 'No Polygon key' });
-    try {
-      const now  = Date.now();
-      const bars = await fetchCandleBars(sym, 15, 'minute', now - 24 * 60 * 60 * 1000, now, 100);
-      return res.status(200).json({ symbol: sym, bars, count: bars.length, source: 'polygon' });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, bars: [], error: e.message || 'Candles15m failed' });
-    }
+    return handleCandlesFormatted(req, res, sym, 15, 'minute', 96);
   }
-
-  // ── Type: agg (ADV — 20-day average daily volume) ────────────────────────────
-  // RULE 2: Read from DB first — only call Polygon if DB miss
   if (type === 'agg') {
-    const isBacktest = req.query.backtest === 'true';
-
-    if (!isBacktest) {
-      const dbRow = await readDBDailyData(sym);
-      if (dbRow?.adv) {
-        console.log(`[quote.js] ADV for ${sym} served from DB (${dbRow.date}): ${dbRow.adv}`);
-        return res.status(200).json({
-          symbol:         sym,
-          avgDailyVolume: dbRow.adv,
-          bars:           0,
-          source:         'db-daily',
-          date:           dbRow.date,
-        });
-      }
-    }
-
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, avgDailyVolume: 0, error: 'No Polygon key' });
-    console.log(`[quote.js] ADV for ${sym} — DB miss, falling back to Polygon`);
-    try {
-      const aggTicker  = toPolygonAggTicker(sym);
-      const to         = new Date();
-      const from       = new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
-      const multiplier = req.query.multiplier ?? 1;
-      const timespan   = req.query.timespan   ?? 'day';
-      const url        = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/range/${multiplier}/${timespan}/${from.toISOString().split('T')[0]}/${to.toISOString().split('T')[0]}?adjusted=true&sort=asc&limit=50&apiKey=${POLYGON_KEY}`;
-      const r = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
-      if (!r.ok) return res.status(200).json({ symbol: sym, avgDailyVolume: 0, results: [], error: `Polygon ${r.status}` });
-      const data = await r.json();
-      const bars = data.results ?? [];
-      if (isBacktest) {
-        return res.status(200).json({ symbol: sym, results: bars, count: bars.length, source: 'polygon' });
-      }
-      const volumes        = bars.map(b => b.v || 0);
-      const avgDailyVolume = volumes.length > 0 ? Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length) : 0;
-      return res.status(200).json({ symbol: sym, avgDailyVolume, bars: bars.length, source: 'polygon-fallback' });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, avgDailyVolume: 0, results: [], error: e.message || 'ADV failed' });
-    }
+    return handleAgg(req, res, sym);
   }
-
-  // ── Type: options (ATM Greeks + IV + P/C ratio) ──────────────────────────────
-  if (type === 'options') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, error: 'No Polygon key' });
-    try {
-      if (isVixTicker(sym)) return res.status(200).json({ symbol: sym, error: 'VIX has no options chain' });
-
-      const { price: spot } = await fetchPolygonSpot(sym);
-      if (!spot) return res.status(200).json({ symbol: sym, error: 'No spot price' });
-
-      const today  = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
-      const optRes = await fetch(
-        `https://api.polygon.io/v3/snapshot/options/${encodeURIComponent(sym)}?expiration_date.gte=${today}&limit=50&apiKey=${POLYGON_KEY}`,
-        { headers: { 'User-Agent': 'Helios/3.0' } }
-      );
-      if (!optRes.ok) return res.status(200).json({ symbol: sym, spot, error: `Options snapshot ${optRes.status}` });
-      const optData  = await optRes.json();
-      const results  = optData?.results ?? [];
-
-      let atmCall = null, atmPut = null;
-      let minCallDist = Infinity, minPutDist = Infinity;
-      let totalCallOI = 0, totalPutOI = 0;
-      let totalCallVol = 0, totalPutVol = 0;
-
-      for (const r of results) {
-        const strike = r.details?.strike_price ?? 0;
-        const dist   = Math.abs(strike - spot);
-        const side   = r.details?.contract_type;
-        const oi     = r.open_interest ?? 0;
-        const vol    = r.day?.volume   ?? 0;
-        if (side === 'call') {
-          totalCallOI  += oi;
-          totalCallVol += vol;
-          if (dist < minCallDist) { minCallDist = dist; atmCall = r; }
-        }
-        if (side === 'put') {
-          totalPutOI  += oi;
-          totalPutVol += vol;
-          if (dist < minPutDist) { minPutDist = dist; atmPut = r; }
-        }
-      }
-
-      const callIV    = atmCall?.implied_volatility ?? atmCall?.greeks?.implied_volatility ?? null;
-      const putIV     = atmPut?.implied_volatility  ?? atmPut?.greeks?.implied_volatility  ?? null;
-      const callGamma = atmCall?.greeks?.gamma ?? null;
-      const callTheta = atmCall?.greeks?.theta ?? null;
-      const callDelta = atmCall?.greeks?.delta ?? null;
-      const putDelta  = atmPut?.greeks?.delta  ?? null;
-      const pcRatio   = totalCallOI > 0 ? totalPutOI / totalCallOI : null;
-
-      const callMid = atmCall ? ((atmCall.last_quote?.ask ?? 0) + (atmCall.last_quote?.bid ?? 0)) / 2 : 0;
-      const putMid  = atmPut  ? ((atmPut.last_quote?.ask  ?? 0) + (atmPut.last_quote?.bid  ?? 0)) / 2 : 0;
-      const impliedMove = spot > 0 && (callMid + putMid) > 0
-        ? ((callMid + putMid) / spot * 100).toFixed(2)
-        : null;
-
-      return res.status(200).json({
-        symbol: sym, spot, callIV, callDelta, callGamma, callTheta,
-        putIV, putDelta, pcRatio, totalCallOI, totalPutOI,
-        totalCallVol, totalPutVol, impliedMove,
-        source: 'polygon-realtime',
-      });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, error: e.message || 'Options Greeks failed' });
-    }
-  }
-
-  // ── Type: hv (Historical Volatility + IV Rank) ───────────────────────────────
-  // RULE 3: Read from DB first — only call Polygon if DB miss
   if (type === 'hv') {
-    if (!POLYGON_KEY) return res.status(200).json({ symbol: sym, error: 'No Polygon key' });
-    if (isVixTicker(sym)) return res.status(200).json({ symbol: sym, error: 'VIX HV not supported' });
-
-    const dbRow = await readDBDailyData(sym);
-    if (dbRow && dbRow.hv20 != null) {
-      console.log(`[quote.js] HV for ${sym} served from DB (${dbRow.date})`);
-      return res.status(200).json({
-        symbol:       sym,
-        hv10:         dbRow.hv10    ?? null,
-        hv20:         dbRow.hv20    ?? null,
-        hv60:         dbRow.hv60    ?? null,
-        hv252:        dbRow.hv252   ?? null,
-        ivRank:       dbRow.iv_rank ?? null,
-        high52w:      dbRow.high_52w ?? null,
-        low52w:       dbRow.low_52w  ?? null,
-        currentClose: dbRow.close   ?? null,
-        totalBars:    252,
-        source:       'db-daily',
-        date:         dbRow.date,
-      });
-    }
-
-    // DB miss — fall back to Polygon 5yr fetch
-    console.log(`[quote.js] HV for ${sym} — DB miss, falling back to Polygon 5yr fetch`);
-    try {
-      const to   = new Date();
-      const from = new Date(to.getTime() - 5 * 365 * 24 * 60 * 60 * 1000);
-      const hvSym = toPolygonAggTicker(sym);
-      const hvRes = await fetch(
-        `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(hvSym)}/range/1/day/${from.toISOString().split('T')[0]}/${to.toISOString().split('T')[0]}?adjusted=true&sort=asc&limit=1500&apiKey=${POLYGON_KEY}`,
-        { headers: { 'User-Agent': 'Helios/3.0' } }
-      );
-      if (!hvRes.ok) return res.status(200).json({ symbol: sym, error: `Polygon HV ${hvRes.status}` });
-      const hvData = await hvRes.json();
-      const bars   = hvData?.results ?? [];
-      if (bars.length < 10) return res.status(200).json({ symbol: sym, error: 'Insufficient price history' });
-
-      const closes = bars.map(b => b.c);
-
-      function calcHV(n) {
-        if (closes.length < n + 1) return null;
-        const recent = closes.slice(-n - 1);
-        const rets   = [];
-        for (let i = 1; i < recent.length; i++) {
-          if (recent[i - 1] > 0) rets.push(Math.log(recent[i] / recent[i - 1]));
-        }
-        if (rets.length < 2) return null;
-        const mean     = rets.reduce((a, b) => a + b, 0) / rets.length;
-        const variance = rets.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (rets.length - 1);
-        return parseFloat((Math.sqrt(variance) * Math.sqrt(252) * 100).toFixed(2));
-      }
-
-      const hv10  = calcHV(10);
-      const hv20  = calcHV(20);
-      const hv60  = calcHV(60);
-      const hv252 = calcHV(252);
-
-      const last252 = closes.slice(-252);
-      const high52w = last252.length ? Math.max(...last252) : null;
-      const low52w  = last252.length ? Math.min(...last252) : null;
-      const currentClose = closes[closes.length - 1] ?? null;
-      const pricePercentile = high52w && low52w && high52w > low52w
-        ? Math.round(((currentClose - low52w) / (high52w - low52w)) * 100) : null;
-
-      let ivHvRatio = null, expensiveOptions = false, cheapOptions = false;
-      try {
-        const optRes2 = await fetch(
-          `https://api.polygon.io/v3/snapshot/options/${encodeURIComponent(sym)}?expiration_date.gte=${new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' })}&limit=10&apiKey=${POLYGON_KEY}`,
-          { headers: { 'User-Agent': 'Helios/3.0' } }
-        );
-        if (optRes2.ok) {
-          const od          = await optRes2.json();
-          const firstResult = od?.results?.[0];
-          const currentIV   = firstResult?.implied_volatility ?? firstResult?.greeks?.implied_volatility ?? null;
-          if (currentIV && hv20) {
-            ivHvRatio        = parseFloat((currentIV / hv20).toFixed(2));
-            expensiveOptions = ivHvRatio > 1.3;
-            cheapOptions     = ivHvRatio < 0.7;
-          }
-        }
-      } catch { /* IV ratio is optional */ }
-
-      const priceHistory = bars.slice(-252).map(b => ({ t: b.t, c: b.c, v: b.v }));
-
-      return res.status(200).json({
-        symbol: sym, hv10, hv20, hv60, hv252,
-        ivHvRatio, expensiveOptions, cheapOptions,
-        high52w, low52w, currentClose, pricePercentile,
-        totalBars: bars.length, priceHistory,
-        source: 'polygon-5yr-fallback',
-      });
-    } catch (e) {
-      return res.status(200).json({ symbol: sym, error: e.message || 'HV computation failed' });
-    }
+    return handleHV(req, res, sym);
   }
-
-  // ── Type: validate_contract (Yahoo Finance existence check) ─────────────────
+  if (type === 'options') {
+    return handleOptions(req, res, sym);
+  }
   if (type === 'validate_contract') {
-    const { expiry, strike, optionType } = req.query;
+    const expiry     = req.query.expiry;
+    const strike     = req.query.strike;
+    const optionType = req.query.optionType;
     if (!expiry || !strike || !optionType) {
-      return res.status(400).json({ error: 'expiry, strike, optionType required' });
+      return res.status(400).json({ error: 'Missing expiry/strike/optionType' });
     }
-    try {
-      const expiryDate = new Date(expiry + 'T12:00:00Z');
-      const expiryUnix = Math.floor(expiryDate.getTime() / 1000);
-      const yahooChain = await fetch(
-        `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(sym)}?date=${expiryUnix}`,
-        { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)', Accept: 'application/json' } }
-      );
-      if (!yahooChain.ok) return res.status(200).json({ exists: false, source: 'yahoo-delayed' });
-      const chainData = await yahooChain.json();
-      const chain     = chainData?.optionChain?.result?.[0];
-      if (!chain) return res.status(200).json({ exists: false, source: 'yahoo-delayed' });
-
-      const targetStrike = parseFloat(strike);
-      const contracts    = optionType === 'call'
-        ? (chain.options?.[0]?.calls ?? [])
-        : (chain.options?.[0]?.puts  ?? []);
-      const match = contracts.find(c => Math.abs(c.strike - targetStrike) < 0.01);
-
-      return res.status(200).json({
-        exists:            !!match,
-        strike:            match?.strike          ?? targetStrike,
-        expiry,
-        optionType,
-        bid:               match?.bid             ?? null,
-        ask:               match?.ask             ?? null,
-        lastPrice:         match?.lastPrice       ?? null,
-        openInterest:      match?.openInterest    ?? null,
-        impliedVolatility: match?.impliedVolatility ?? null,
-        source:            'yahoo-delayed',
-      });
-    } catch (e) {
-      return res.status(200).json({ exists: false, error: e.message, source: 'yahoo-validate-failed' });
-    }
+    return handleValidateContract(req, res, sym, expiry, strike, optionType);
   }
 
-  // ── Main quote — all non-VIX tickers: Polygon primary, Yahoo fallback ────────
-  if (!POLYGON_KEY) {
-    try {
-      const q = await fetchYahooQuote(sym);
-      return res.status(200).json({ ...q, symbol: sym, bid: null, ask: null, lastTradeSize: null, lastTradeTime: null });
-    } catch {
-      return res.status(200).json({ symbol: sym, price: 0, error: 'No Polygon key and Yahoo failed' });
-    }
-  }
-
+  // Default: live quote (Polygon primary, Yahoo fallback)
   try {
     const spot = await fetchPolygonSpot(sym);
     if (!spot.price) {
