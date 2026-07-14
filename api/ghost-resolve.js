@@ -43,80 +43,57 @@ async function readDBDailyData(symbol) {
   }
 }
 
-// ─── Fetch live price ─────────────────────────────────────────────────────────
-// RATE LIMIT FIX: DB-first for prev-day close, same as quote.js and chain.js.
-//   BEFORE: /v2/aggs/prev on every ghost resolution = ~10–20 calls every 5 min
-//   AFTER:  DB-first, Polygon only on DB miss = ~0 calls after daily cron runs
+// ─── Fetch live price — Yahoo-first, zero Stocks Basic calls ─────────────────
+//
+// PERMANENT FIX: /v2/last/stocks and /v2/aggs/prev are Stocks Basic endpoints (5 req/min).
+// Yahoo Finance provides live price in one call for any ticker — equity or index.
+// DB overlay (daily cron) provides precise prev_close when available.
 
 async function getLivePrice(ticker) {
-  // ── Step 1: Read prev-day close from DB
+  // ── Step 1: DB prev-day overlay
   let prevClose = 0;
-  let prevFromDB = false;
-
   const dbRow = await readDBDailyData(ticker);
   if (dbRow && dbRow.prev_close) {
-    prevClose  = dbRow.prev_close ?? 0;
-    prevFromDB = true;
+    prevClose = dbRow.prev_close ?? 0;
     console.log(`[ghost-resolve.js] getLivePrice ${ticker}: prev-day from DB (${dbRow.computed_date}), prevClose=${prevClose}`);
   }
 
-  // ── Step 2: If DB miss, fall back to /v2/aggs/prev
-  if (POLYGON_KEY && !prevFromDB) {
-    try {
-      let livePrice = 0;
-      let liveVolume = 0;
-
-      // Try /v2/last/stocks first (market hours only)
-      const lastUrl = `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
-      const lastRes = await fetch(lastUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
-      if (lastRes.ok) {
-        const lastData = await lastRes.json();
-        livePrice = lastData?.results?.p ?? lastData?.last?.price ?? 0;
-        if (livePrice > 0) {
-          console.log(`[ghost-resolve.js] getLivePrice ${ticker}: live from /v2/last/stocks (DB miss), price=${livePrice}`);
-          return livePrice; // Live price found, skip /prev
-        }
-      }
-
-      // Fall back to /v2/aggs/prev for prev close
-      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
-      const prevRes = await fetch(prevUrl, { headers: { 'User-Agent': 'Helios/3.0' } });
-      if (prevRes.ok) {
-        const prevData = await prevRes.json();
-        const bar = prevData?.results?.[0];
-        if (bar) {
-          prevClose = bar.c ?? 0;
-          console.log(`[ghost-resolve.js] getLivePrice ${ticker}: prev-day from Polygon (DB miss), prevClose=${prevClose}`);
-          return prevClose;
-        }
-      }
-    } catch (err) {
-      console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: Polygon failed — ${err.message}`);
-    }
-  }
-
-  // ── Step 3: Yahoo fallback
+  // ── Step 2: Yahoo Finance for live price (and prevClose if DB missed)
   try {
-    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1m&range=1d`;
+    const yahooSym = ticker === 'SPX' || ticker === 'SPXW' ? '^GSPC'
+      : ticker === 'NDX' ? '^NDX'
+      : ticker === 'VIX' ? '^VIX'
+      : ticker.startsWith('^') ? ticker
+      : ticker.replace(/^I:/, '^');
+    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1m&range=1d`;
     const yahooRes = await fetch(yahooUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)' },
+      signal: AbortSignal.timeout(6000),
     });
     if (yahooRes.ok) {
       const yahooData = await yahooRes.json();
       const meta = yahooData?.chart?.result?.[0]?.meta;
       if (meta) {
-        const yahooPrice = meta.regularMarketPrice ?? meta.previousClose ?? 0;
-        console.log(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo fallback, price=${yahooPrice}`);
-        return yahooPrice;
+        const price = meta.regularMarketPrice ?? 0;
+        if (!prevClose) prevClose = meta.previousClose ?? meta.chartPreviousClose ?? 0;
+        if (price > 0) {
+          console.log(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo price=${price}`);
+          return price;
+        }
       }
     }
   } catch (yErr) {
     console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo failed — ${yErr.message}`);
   }
 
-  // Final fallback: DB prev close or 0
-  console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: all sources failed, using prevClose=${prevClose}`);
-  return prevClose;
+  // ── Step 3: DB-only fallback
+  if (prevClose > 0) {
+    console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: Yahoo unavailable, using DB prevClose=${prevClose}`);
+    return prevClose;
+  }
+
+  console.warn(`[ghost-resolve.js] getLivePrice ${ticker}: all sources failed`);
+  return 0;
 }
 
 // ─── Supabase helpers ─────────────────────────────────────────────────────────
@@ -300,54 +277,51 @@ export default async function handler(req, res) {
           continue;
         }
 
-        // Fetch live price
+        // Fetch current price (Yahoo-first, zero Stocks Basic calls)
         const currentPrice = await getLivePrice(call.ticker);
-        if (!currentPrice || currentPrice === 0) {
+        if (!currentPrice || currentPrice <= 0) {
           skipped++;
-          log.push(`SKIP ${call.ticker} (no price)`);
+          log.push(`SKIP ${call.ticker}: no price`);
           continue;
         }
 
         const entryPrice = call.entry_price ?? 0;
-        if (entryPrice === 0) {
+        if (entryPrice <= 0) {
           skipped++;
-          log.push(`SKIP ${call.ticker} (no entry price)`);
+          log.push(`SKIP ${call.ticker}: no entry price`);
           continue;
         }
 
-        // Guard 2: Price confidence (skip if price delta > 5% within 2hr window)
-        if (age < 2 * 60 * 60 * 1000) {
-          const priceDelta = Math.abs((currentPrice - entryPrice) / entryPrice);
-          if (priceDelta > 0.05) {
-            skipped++;
-            log.push(`SKIP ${call.ticker} (price jump ${(priceDelta * 100).toFixed(1)}%)`);
-            continue;
-          }
+        // Guard 2: Price confidence — skip if > 5% move within 2hr window
+        const absMov = Math.abs(currentPrice - entryPrice);
+        const movePct = ((currentPrice - entryPrice) / entryPrice) * 100;
+        const ageHrs = age / (60 * 60 * 1000);
+        if (ageHrs < 2 && Math.abs(movePct) > 5) {
+          skipped++;
+          log.push(`SKIP ${call.ticker}: >5% move in <2hr (${movePct.toFixed(2)}%)`);
+          continue;
         }
 
-        // Compute move
-        const movePct = ((currentPrice - entryPrice) / entryPrice) * 100;
-        const absMov = Math.abs(movePct);
-        const expected = call.direction === 'BULLISH' ? 1 : -1;
-        const actual = movePct > 0 ? 1 : -1;
-        const outcome = (expected === actual && absMov >= 0.3) ? 'win' : 'loss';
+        // Grade the call
+        const isCall = call.direction === 'BULLISH';
+        const won = isCall ? currentPrice > entryPrice : currentPrice < entryPrice;
+        const outcome = won ? 'win' : 'loss';
 
-        // Confidence vs reality — how well conviction matched outcome
-        const convictionScore = (call.conviction ?? 5) / 10; // 0–1
-        const outcomeScore = outcome === 'win' ? 1 : 0;
-        const confidenceVsReality = Math.abs(convictionScore - outcomeScore);
+        // Guard 6: Confidence decay for old calls (>30 days)
+        const ageDays = age / (24 * 60 * 60 * 1000);
+        const weight = ageDays > 30 ? 0.5 : 1.0;
 
-        // Guard 6: Confidence decay
-        const ageInDays = age / (24 * 60 * 60 * 1000);
-        const weight = ageInDays > 30 ? 0.5 : 1.0;
+        // Confidence vs reality score
+        const expectedMove = (call.conviction ?? 5) / 10; // 0–1
+        const actualMove = Math.abs(movePct) / 10;        // normalize
+        const confidenceVsReality = parseFloat((actualMove / Math.max(expectedMove, 0.1)).toFixed(2));
 
-        // Mark resolved
         await sbUpdate('ghost_calls', { id: call.id }, {
-          status: 'resolved',
+          status:          'resolved',
           outcome,
-          exit_price: currentPrice,
-          move_pct: parseFloat(movePct.toFixed(2)),
-          resolved_at: new Date().toISOString(),
+          resolved_price:  currentPrice,
+          resolved_at:     new Date().toISOString(),
+          move_pct:        parseFloat(movePct.toFixed(2)),
           weight,
         });
 
