@@ -2,6 +2,10 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 400;
 const MAX_PAGES = 10;
 
+// ── ENV vars (needed by fetchSpot DB overlay) ─────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+
 // Index ticker normalization — same as quote.js
 const INDEX_TICKER_MAP = { SPX: 'I:SPX', SPXW: 'I:SPX', NDX: 'I:NDX', VIX: 'I:VIX' };
 
@@ -23,7 +27,7 @@ async function polygonFetch(url, attempt = 1) {
     const res = await fetch(url, { headers: { 'User-Agent': 'Helios/3.0' } });
     if (res.status === 429) {
       if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt * 2); // exponential: 800ms, 1600ms
+        await sleep(RETRY_DELAY_MS * attempt * 2);
         return polygonFetch(url, attempt + 1);
       }
       console.error('[chain.js] Polygon 429 after all retries');
@@ -56,7 +60,6 @@ async function fetchAllPages(initialUrl) {
   const results = [];
   let url = initialUrl;
   let pageCount = 0;
-
   while (url && pageCount < MAX_PAGES) {
     const r = await polygonFetch(url);
     if (!r) break;
@@ -69,29 +72,140 @@ async function fetchAllPages(initialUrl) {
     pageCount++;
     if (url) await sleep(80);
   }
-
   if (pageCount >= MAX_PAGES) {
     console.warn(`[chain.js] Hit MAX_PAGES cap (${MAX_PAGES}) — some contracts may be missing`);
   }
-
   return results;
+}
+
+async function readDBDailyData(symbol) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/daily_market_data?symbol=eq.${encodeURIComponent(symbol)}&order=computed_date.desc&limit=1&select=*`;
+    const r = await fetch(url, {
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+      },
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const row = rows[0];
+    const rowDate = new Date(row.computed_date + 'T00:00:00');
+    const ageMs = Date.now() - rowDate.getTime();
+    if (ageMs > 7 * 24 * 60 * 60 * 1000) {
+      console.warn(`[chain.js] DB daily_market_data stale for ${symbol} (${row.computed_date})`);
+      return null;
+    }
+    return row;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSpot(ticker) {
+  const sym = ticker.toUpperCase();
+  let prevClose = 0;
+  let prevVwap = 0;
+  let prevFromDB = false;
+  const dbRow = await readDBDailyData(sym);
+  if (dbRow && dbRow.prev_close) {
+    prevClose = dbRow.prev_close ?? 0;
+    prevVwap = dbRow.prev_vwap ?? 0;
+    prevFromDB = true;
+    console.log(`[chain.js] fetchSpot ${ticker}: prev-day from DB (${dbRow.computed_date}), prevClose=${prevClose}`);
+  }
+  try {
+    const yahooTicker = sym === 'SPX' || sym === 'SPXW' ? '^GSPC'
+      : sym === 'NDX' ? '^NDX'
+      : sym === 'VIX' ? '^VIX'
+      : sym.startsWith('I:') ? '^' + sym.slice(2)
+      : sym;
+    const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooTicker)}?interval=1m&range=1d`;
+    const yRes = await fetch(yUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Helios/3.0)', 'Accept': 'application/json' },
+    });
+    if (yRes.ok) {
+      const yData = await yRes.json();
+      const meta = yData?.chart?.result?.[0]?.meta;
+      if (meta) {
+        const livePrice = meta.regularMarketPrice ?? 0;
+        if (!prevFromDB) {
+          prevClose = meta.previousClose ?? meta.chartPreviousClose ?? 0;
+        }
+        if (livePrice > 0) {
+          console.log(`[chain.js] fetchSpot ${ticker}: live=${livePrice}, prevClose=${prevClose}, src=${prevFromDB ? 'yahoo+db' : 'yahoo'}`);
+          return { price: livePrice, prevClose, vwap: prevVwap };
+        }
+      }
+    }
+  } catch (yErr) {
+    console.warn(`[chain.js] fetchSpot ${ticker}: Yahoo failed — ${yErr.message}`);
+  }
+  console.log(`[chain.js] fetchSpot ${ticker}: Yahoo unavailable, using DB prevClose=${prevClose}`);
+  return { price: prevClose, prevClose, vwap: prevVwap };
+}
+
+async function fetchExpiryDates(ticker, polygonKey) {
+  const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
+  const r = await polygonFetch(url);
+  if (!r) return [];
+  let data;
+  try { data = await r.json(); } catch { return []; }
+  if (!Array.isArray(data.results)) return [];
+  const dates = new Set();
+  data.results.forEach(c => { if (c.expiration_date) dates.add(c.expiration_date); });
+  return Array.from(dates).sort();
+}
+
+function isBlockTrade(contract) {
+  const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
+  if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
+  const lastSize = contract.market_data?.last_trade?.size ?? 0;
+  return lastSize >= 50;
+}
+
+function computeVWIV(contracts, side) {
+  let totalVol = 0;
+  let weightedIV = 0;
+  contracts.forEach(c => {
+    const iv = side === 'call' ? c.callIV : c.putIV;
+    const vol = side === 'call' ? c.callVolume : c.putVolume;
+    if (iv > 0 && vol > 0) {
+      weightedIV += iv * vol;
+      totalVol += vol;
+    }
+  });
+  return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
+}
+
+function findOIWalls(contracts, side) {
+  const sorted = [...contracts]
+    .filter(c => side === 'call' ? c.callOI > 0 : c.putOI > 0)
+    .sort((a, b) => (side === 'call' ? b.callOI - a.callOI : b.putOI - a.putOI))
+    .slice(0, 5);
+  return sorted.map(c => ({
+    strike: c.strike,
+    oi: side === 'call' ? c.callOI : c.putOI,
+  }));
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { symbol, datesOnly, expiration, allExpiries } = req.query;
+
   if (!symbol) {
     return res.status(400).json({ error: 'symbol parameter required' });
   }
 
   const sym = symbol.toUpperCase().trim();
-  const polygonKey = process.env.POLYGON_API_KEY;
 
+  const polygonKey = process.env.POLYGON_API_KEY;
   if (!polygonKey) {
     return res.status(500).json({
       error: 'POLYGON_API_KEY not configured',
@@ -100,101 +214,9 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // ─── Spot price helper — fixed for index tickers ─────────────────────────────
-  async function fetchSpot(ticker) {
-    try {
-      const aggTicker = toPolygonAggTicker(ticker);
-
-      // 1. Prev-day aggregate — always works, 24/7
-      const prevUrl = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggTicker)}/prev?adjusted=true&apiKey=${polygonKey}`;
-      const prevR = await polygonFetch(prevUrl);
-      let prevClose = 0;
-      let prevVwap = 0;
-
-      if (prevR) {
-        const prevData = await prevR.json();
-        const bar = prevData?.results?.[0];
-        if (bar) {
-          prevClose = bar.c ?? 0;
-          prevVwap = bar.vw ?? 0;
-        }
-      }
-
-      // 2. Live last trade
-      // INDEX tickers → /v2/last/trade/I:SPX (NOT /v2/last/stocks/ — returns 403 on indices)
-      // Equity tickers → /v2/last/stocks/{ticker}
-      let livePrice = 0;
-      try {
-        const lastUrl = isIndexTicker(ticker)
-          ? `https://api.polygon.io/v2/last/trade/${encodeURIComponent(aggTicker)}?apiKey=${polygonKey}`
-          : `https://api.polygon.io/v2/last/stocks/${encodeURIComponent(ticker)}?apiKey=${polygonKey}`;
-        const lastR = await polygonFetch(lastUrl);
-        if (lastR) {
-          const lastData = await lastR.json();
-          livePrice = lastData?.results?.p ?? lastData?.last?.price ?? 0;
-        }
-      } catch {
-        // live price unavailable — fall through to prevClose
-      }
-
-      const price = livePrice > 0 ? livePrice : prevClose;
-      console.log(`[chain.js] fetchSpot ${ticker} (agg=${aggTicker}): live=${livePrice}, prev=${prevClose}, using=${price}`);
-
-      return { price, prevClose, vwap: prevVwap };
-    } catch {
-      return { price: 0, prevClose: 0, vwap: 0 };
-    }
-  }
-
-  async function fetchExpiryDates(ticker) {
-    const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${ticker}&limit=1000&apiKey=${polygonKey}`;
-    const r = await polygonFetch(url);
-    if (!r) return [];
-    let data;
-    try { data = await r.json(); } catch { return []; }
-    if (!Array.isArray(data.results)) return [];
-
-    const dates = new Set();
-    data.results.forEach(c => { if (c.expiration_date) dates.add(c.expiration_date); });
-    return Array.from(dates).sort();
-  }
-
-  function isBlockTrade(contract) {
-    const conditions = contract.day?.conditions ?? contract.market_data?.conditions ?? [];
-    if (Array.isArray(conditions) && conditions.some(c => c === 41 || c === '41')) return true;
-    const lastSize = contract.market_data?.last_trade?.size ?? 0;
-    return lastSize >= 50;
-  }
-
-  function computeVWIV(contracts, side) {
-    let totalVol = 0;
-    let weightedIV = 0;
-    contracts.forEach(c => {
-      const iv = side === 'call' ? c.callIV : c.putIV;
-      const vol = side === 'call' ? c.callVolume : c.putVolume;
-      if (iv > 0 && vol > 0) {
-        weightedIV += iv * vol;
-        totalVol += vol;
-      }
-    });
-    return totalVol > 0 ? parseFloat((weightedIV / totalVol).toFixed(1)) : null;
-  }
-
-  function findOIWalls(contracts, side) {
-    const sorted = [...contracts]
-      .filter(c => side === 'call' ? c.callOI > 0 : c.putOI > 0)
-      .sort((a, b) => (side === 'call' ? b.callOI - a.callOI : b.putOI - a.putOI))
-      .slice(0, 5);
-    return sorted.map(c => ({
-      strike: c.strike,
-      oi: side === 'call' ? c.callOI : c.putOI,
-    }));
-  }
-
-  // ─── MODE 1: Expiry dates only ────────────────────────────────────────────────
   if (datesOnly === 'true') {
     try {
-      const sortedDates = await fetchExpiryDates(sym);
+      const sortedDates = await fetchExpiryDates(sym, polygonKey);
       return res.status(200).json({ expiryDates: sortedDates, count: sortedDates.length });
     } catch (error) {
       console.error('Error fetching expiry dates:', error);
@@ -202,10 +224,9 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── MODE 3: Multi-expiry GEX stack ──────────────────────────────────────────
   if (allExpiries === 'true') {
     try {
-      const allDates = await fetchExpiryDates(sym);
+      const allDates = await fetchExpiryDates(sym, polygonKey);
       const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Chicago' });
       const upcoming = allDates.filter(d => d >= today).slice(0, 8);
 
@@ -215,20 +236,17 @@ module.exports = async function handler(req, res) {
 
       const { price: spot } = await fetchSpot(sym);
 
-      // SERIALIZED — not Promise.all — to avoid 429 blast from 8 simultaneous fetches
       const expiryGEX = [];
       for (const expDate of upcoming) {
         try {
           const callsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
           const putsUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${expDate}&limit=250&apiKey=${polygonKey}`;
-
           const calls = await fetchAllPages(callsUrl);
           await sleep(100);
           const puts = await fetchAllPages(putsUrl);
           await sleep(120);
 
           const strikeMap = new Map();
-
           calls.forEach(c => {
             const strike = c.details?.strike_price;
             if (!strike) return;
@@ -237,7 +255,6 @@ module.exports = async function handler(req, res) {
             if (!strikeMap.has(strike)) strikeMap.set(strike, { strike, callGEX: 0, putGEX: 0 });
             strikeMap.get(strike).callGEX = oi * gamma * spot * spot * 100;
           });
-
           puts.forEach(p => {
             const strike = p.details?.strike_price;
             if (!strike) return;
@@ -251,32 +268,28 @@ module.exports = async function handler(req, res) {
             strike: s.strike,
             netGEX: s.callGEX - s.putGEX,
           }));
-
           const totalNetGEX = strikes.reduce((sum, s) => sum + s.netGEX, 0);
           const dominantWall = strikes.reduce((best, s) =>
             Math.abs(s.netGEX) > Math.abs(best?.netGEX ?? 0) ? s : best, null);
 
           expiryGEX.push({ expiry: expDate, strikes, totalNetGEX, dominantWall });
         } catch {
-          // skip this expiry
         }
       }
 
       return res.status(200).json({ symbol: sym, spot, expiryGEX, source: 'polygon-realtime' });
-
     } catch (error) {
       console.error('Error fetching multi-expiry GEX:', error);
       return res.status(200).json({ symbol: sym, expiryGEX: [], source: 'polygon-error' });
     }
   }
 
-  // ─── MODE 2: Full options chain ───────────────────────────────────────────────
   if (expiration) {
     try {
       let resolvedExpiration = expiration;
-      const validDates = await fetchExpiryDates(sym);
-      const isValidDate = validDates.includes(expiration);
 
+      const validDates = await fetchExpiryDates(sym, polygonKey);
+      const isValidDate = validDates.includes(expiration);
       if (!isValidDate && validDates.length > 0) {
         console.warn(`[chain.js] ${expiration} not in expiry list for ${sym} — sliding to nearest`);
         const nearest = validDates.find(d => d >= expiration) ?? validDates[0];
@@ -287,7 +300,6 @@ module.exports = async function handler(req, res) {
       const callsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=call&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
       const putsBaseUrl = `https://api.polygon.io/v3/snapshot/options/${sym}?contract_type=put&expiration_date=${resolvedExpiration}&limit=250&apiKey=${polygonKey}`;
 
-      // Stagger calls and puts — small gap prevents simultaneous 429
       const callsResults = await fetchAllPages(callsBaseUrl);
       await sleep(100);
       const putsResults = await fetchAllPages(putsBaseUrl);
@@ -311,7 +323,6 @@ module.exports = async function handler(req, res) {
       let spotPrevClose = 0;
       let spotVwap = 0;
 
-      // Try to extract spot from the underlying_asset field of the snapshot response
       const ua = callsResults[0]?.underlying_asset ?? putsResults[0]?.underlying_asset ?? null;
       if (ua && ua.price > 0) {
         spot = ua.price;
@@ -319,7 +330,6 @@ module.exports = async function handler(req, res) {
         spotVwap = ua.day?.vw ?? 0;
       }
 
-      // If not available from snapshot, fetch directly (with index-aware endpoint)
       if (spot <= 0) {
         const fallback = await fetchSpot(sym);
         spot = fallback.price;
@@ -337,7 +347,6 @@ module.exports = async function handler(req, res) {
         if (!contractMap.has(strike)) {
           contractMap.set(strike, {
             strike,
-            // ✅ OCC symbols for WebSocket subscription and bid/ask patching
             callOCC: null,
             putOCC: null,
             callBid: 0, callAsk: 0, callIV: 0, callOI: 0, callVolume: 0,
@@ -359,37 +368,30 @@ module.exports = async function handler(req, res) {
       callsResults.forEach(c => {
         const strike = c.details?.strike_price;
         if (!strike) return;
-
         const entry = ensureStrike(strike);
-
         const bid = c.last_quote?.bid ?? 0;
         const ask = c.last_quote?.ask ?? 0;
         const lastTradePrice = c.last_trade?.price ?? c.last_quote?.midpoint ?? 0;
-
         entry.callBid = bid;
         entry.callAsk = ask;
         entry.callLast = lastTradePrice;
-        entry.callOCC = c.details?.ticker ?? null; // ✅ OCC symbol e.g. "O:SPY260918C00580000"
-
+        entry.callOCC = c.details?.ticker ?? null;
         entry.callIV = c.greeks?.implied_volatility != null
           ? parseFloat((c.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.callOI = c.open_interest ?? 0;
         entry.callVolume = c.day?.volume ?? c.volume ?? 0;
-
         entry.callDelta = c.greeks?.delta ?? null;
         entry.callTheta = c.greeks?.theta ?? null;
         entry.callGamma = c.greeks?.gamma ?? null;
         entry.callVega = c.greeks?.vega ?? null;
         entry.callVanna = c.greeks?.vanna ?? null;
         entry.callCharm = c.greeks?.charm ?? null;
-
         entry.callDayVol = c.day?.volume ?? 0;
         entry.callPrevDayVol = c.prev_day?.volume ?? 0;
         entry.callVolumeRatio = entry.callPrevDayVol > 0
           ? parseFloat((entry.callDayVol / entry.callPrevDayVol).toFixed(2))
           : null;
-
         entry.callBlockTrade = isBlockTrade(c);
         entry.callIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
@@ -397,37 +399,30 @@ module.exports = async function handler(req, res) {
       putsResults.forEach(p => {
         const strike = p.details?.strike_price;
         if (!strike) return;
-
         const entry = ensureStrike(strike);
-
         const bid = p.last_quote?.bid ?? 0;
         const ask = p.last_quote?.ask ?? 0;
         const lastTradePrice = p.last_trade?.price ?? p.last_quote?.midpoint ?? 0;
-
         entry.putBid = bid;
         entry.putAsk = ask;
         entry.putLast = lastTradePrice;
-        entry.putOCC = p.details?.ticker ?? null; // ✅ OCC symbol e.g. "O:SPY260918P00580000"
-
+        entry.putOCC = p.details?.ticker ?? null;
         entry.putIV = p.greeks?.implied_volatility != null
           ? parseFloat((p.greeks.implied_volatility * 100).toFixed(1))
           : 0;
         entry.putOI = p.open_interest ?? 0;
         entry.putVolume = p.day?.volume ?? p.volume ?? 0;
-
         entry.putDelta = p.greeks?.delta ?? null;
         entry.putTheta = p.greeks?.theta ?? null;
         entry.putGamma = p.greeks?.gamma ?? null;
         entry.putVega = p.greeks?.vega ?? null;
         entry.putVanna = p.greeks?.vanna ?? null;
         entry.putCharm = p.greeks?.charm ?? null;
-
         entry.putDayVol = p.day?.volume ?? 0;
         entry.putPrevDayVol = p.prev_day?.volume ?? 0;
         entry.putVolumeRatio = entry.putPrevDayVol > 0
           ? parseFloat((entry.putDayVol / entry.putPrevDayVol).toFixed(2))
           : null;
-
         entry.putBlockTrade = isBlockTrade(p);
         entry.putIlliquid = ask > 0 && (ask - bid) / ask > 0.5;
       });
@@ -469,7 +464,6 @@ module.exports = async function handler(req, res) {
       const putOIWalls = findOIWalls(contracts, 'put');
       const blockCallCount = contracts.filter(c => c.callBlockTrade).length;
       const blockPutCount = contracts.filter(c => c.putBlockTrade).length;
-
       const gammaCount = contracts.filter(c => c.callGamma !== null || c.putGamma !== null).length;
       const sampleContracts = contracts.slice(0, 3).map(c => ({
         strike: c.strike,
@@ -479,7 +473,6 @@ module.exports = async function handler(req, res) {
         putBid: c.putBid, putAsk: c.putAsk, putLast: c.putLast,
         callGamma: c.callGamma, callDelta: c.callDelta,
       }));
-
       console.log(`[chain.js] Gamma: ${gammaCount}/${contracts.length} contracts have gamma`);
       console.log(`[chain.js] Spot: ${spot} (prevClose: ${spotPrevClose}, change: ${spotChangePct.toFixed(2)}%)`);
       console.log('[chain.js] Sample (with OCC symbols):', JSON.stringify(sampleContracts, null, 2));
@@ -510,7 +503,6 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ─── No mode specified ────────────────────────────────────────────────────────
   return res.status(400).json({
     error: 'Either datesOnly=true, expiration, or allExpiries=true required',
     usage: 'GET /api/chain?symbol=TSLA&datesOnly=true OR /api/chain?symbol=TSLA&expiration=2026-06-20 OR /api/chain?symbol=TSLA&allExpiries=true',
