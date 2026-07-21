@@ -1,6 +1,11 @@
 const POLYGON_KEY  = process.env.POLYGON_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || 'https://giglh3q70r3ro3.cloud.wegic.net';
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzgwNDI4NDM3LCJleHAiOjEzMjkxMDY4NDM3fQ.4BVrfm0wglB1rUtX5ZAcouqBtudlk1GTzrVtfoobvUU';
+// IMPORTANT: Do NOT add hardcoded fallback URLs here.
+// VITE_* env vars are Vite build-time inlines — NOT available as process.env.VITE_* in Vercel
+// serverless functions. Only SUPABASE_URL and SUPABASE_ANON_KEY (no VITE_ prefix) work here.
+// If these are undefined, DB writes fail silently and daily_market_data stops updating.
+// Add SUPABASE_URL and SUPABASE_ANON_KEY (non-VITE prefix) in Vercel → Settings → Env Vars.
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || null;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || null;
 const CRON_SECRET  = process.env.CRON_SECRET ?? 'helios-cron';
 
 // All platform tickers — includes main 24 + 8 cross-asset ETFs used by crossAssetMatrix.ts
@@ -54,8 +59,10 @@ function isWeekend() {
  * PERMANENT GUARD: Daily cron MUST NOT run while market is active.
  * Running it during market hours would blast 700+ Polygon aggregate calls,
  * wiping the rate limit budget exactly when candles + quotes need it most.
- * The cron is scheduled at 21:05 UTC = 4:05 PM CT — AFTER close.
- * This guard is a safety net in case someone manually triggers it.
+ * The cron is scheduled at 22:05 UTC = 4:05 PM CST (winter) / 5:05 PM CDT (summer).
+ * Previously scheduled at 21:05 UTC which fired at 3:05 PM CT during CDT — inside market hours,
+ * causing the guard to silently block it for ~8 months per year. Fixed to 22:05 UTC.
+ * This guard remains a safety net in case someone manually triggers it during market hours.
  */
 function isMarketHours() {
   const ct = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' }));
@@ -68,24 +75,54 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ─── Per-run daily bar cache ──────────────────────────────────────────────────
+// Populated during Phase A (processHVTicker). Phase B (processCalibrationTicker)
+// reads from this cache — zero second fetch for the same ticker in the same run.
+// Keyed by uppercase symbol. Cleared once at handler start.
+const _dailyBarCache = new Map();
+
 // ─── Polygon fetch with retry + 429 backoff ───────────────────────────────────
+// Reduced from 4 attempts / 800ms backoff to 2 attempts / 300ms backoff.
+// Rationale: Yahoo daily bars are the real 429 source. Polygon Stocks Basic 429s
+// are systemic (budget exhausted) not transient — more retries just waste seconds.
+// With 33 tickers the old retry chain was burning 10+ seconds per failed ticker.
+// Global budget reduced from 15 to 8 — if 8 Polygon 429s fire, something is
+// systemically wrong and we should stop rather than consume the 300s wall clock.
+let globalRetryCount = 0;
+const MAX_GLOBAL_RETRIES = 8;
 
 async function polyFetch(url, attempt = 1) {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Helios-DailyCron/1.0' },
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(12_000),
     });
     if (res.status === 429) {
-      if (attempt >= 4) return null;
-      const backoff = 800 * attempt; // 800ms, 1600ms, 2400ms
-      console.log(`[daily-cron] 429 on attempt ${attempt}, backing off ${backoff}ms`);
-      await sleep(backoff);
+      globalRetryCount++;
+      const remaining = res.headers.get('X-RateLimit-Remaining');
+      const resetTime = res.headers.get('X-RateLimit-Reset');
+
+      if (globalRetryCount >= MAX_GLOBAL_RETRIES) {
+        console.error(`[daily-cron] GLOBAL RETRY BUDGET EXHAUSTED (${MAX_GLOBAL_RETRIES}) — stopping retries`);
+        return null;
+      }
+
+      console.warn(`[daily-cron] 429 attempt ${attempt}/2 (remaining=${remaining ?? '?'} reset=${resetTime ?? '?'}) global=${globalRetryCount}/${MAX_GLOBAL_RETRIES}`);
+
+      if (attempt >= 2) {
+        console.error(`[daily-cron] polyFetch gave up after 2 attempts — ${url.split('apiKey=')[0]}`);
+        return null;
+      }
+      await sleep(300 * attempt); // 300ms, 600ms
       return polyFetch(url, attempt + 1);
     }
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[daily-cron] polyFetch HTTP ${res.status} — ${url.split('apiKey=')[0]}`);
+      return null;
+    }
     return res.json();
-  } catch {
+  } catch (e) {
+    console.warn(`[daily-cron] polyFetch error: ${e.message}`);
     return null;
   }
 }
@@ -118,14 +155,12 @@ async function fetchDailyBars(symbol, years = 5) {
 
   const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(aggSym)}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=1500&apiKey=${POLYGON_KEY}`;
 
-  // Retry once on empty — handles transient 429 that polyFetch already backed off from
-  let data = await polyFetch(url);
+  // Single fetch only — polyFetch already retries 4x internally (800/1600/2400ms backoff).
+  // REMOVED: second-layer retry that was causing 8-call storms per stuck ticker.
+  // With 33 tickers and 700ms gaps, double-retry amplification starves later tickers.
+  const data = await polyFetch(url);
   if (!data?.results?.length) {
-    await sleep(1200);
-    data = await polyFetch(url);
-  }
-  if (!data?.results?.length) {
-    console.warn(`[daily-cron] fetchDailyBars ${symbol} (${aggSym}): no results returned`);
+    console.warn(`[daily-cron] fetchDailyBars ${symbol} (${aggSym}): no results after polyFetch retry chain`);
     return [];
   }
 
@@ -231,10 +266,13 @@ function computeHVData(symbol, bars) {
     : 50;
 
   // ADV — 20-day average daily volume
-  const recentVols = bars.slice(-20).map(b => b.volume);
-  const adv = recentVols.length > 0
+  // Guard: index bars (NDX, VIX) may have v=undefined or v=0 — filter those out
+  // before averaging to prevent NaN. If all 20 bars have no volume (pure index),
+  // ADV stays null rather than 0, signalling RD-3 logic to skip volume confirmation.
+  const recentVols = bars.slice(-20).map(b => b.volume).filter(v => typeof v === 'number' && v > 0);
+  const adv = recentVols.length >= 5
     ? Math.round(recentVols.reduce((a, b) => a + b, 0) / recentVols.length)
-    : 0;
+    : null; // null = index or illiquid — not 0, so callers can distinguish
 
   // IV rank from range-based vol proxy (52w daily ranges as IV baseline)
   // Formula: (daily_range / open) × sqrt(252) × 100 — annualized, same scale as real IV
@@ -520,11 +558,14 @@ async function processHVTicker(symbol) {
     return false;
   }
 
+  // Cache bars so Phase B (calibration) can reuse without a second fetch
+  _dailyBarCache.set(symbol.toUpperCase(), bars);
+
   const hvData = computeHVData(symbol, bars);
   if (!hvData) return false;
 
   const ok = await dbUpsert('daily_market_data', hvData, ['symbol', 'computed_date']);
-  console.log(`[daily-cron] HV ${symbol}: ${ok ? '✅ saved' : '❌ failed'} — HV20=${hvData.hv20}% ADV=${hvData.adv?.toLocaleString()}`);
+  console.log(`[daily-cron] HV ${symbol}: ${ok ? '✅ saved' : '❌ failed'} — HV20=${hvData.hv20}% ADV=${hvData.adv != null ? hvData.adv.toLocaleString() : 'N/A (index)'}`);
   return ok;
 }
 
@@ -532,7 +573,14 @@ async function processHVTicker(symbol) {
 
 async function processCalibrationTicker(symbol, allPriors) {
   console.log(`[daily-cron] CAL: processing ${symbol}`);
-  const bars = await fetchDailyBars(symbol, 5);
+
+  // Use cached bars from Phase A — zero second fetch
+  const cached = _dailyBarCache.get(symbol.toUpperCase());
+  const bars = cached ?? await fetchDailyBars(symbol, 5);
+  if (!cached) {
+    console.log(`[daily-cron] CAL ${symbol}: cache miss — fetched fresh`);
+  }
+
   if (bars.length < 30) {
     console.warn(`[daily-cron] CAL ${symbol}: insufficient daily bars — skipping`);
     return;
@@ -553,15 +601,19 @@ async function processCalibrationTicker(symbol, allPriors) {
 
   const allOutcomes = [];
 
-  for (const dayBar of sample) {
-    const intradayBars = await fetchIntradayBars5m(symbol, dayBar.date);
-    await sleep(300);
+  for (let di = 0; di < sample.length; di++) {
+    const dayBar = sample[di];
+    const dayIdx = bars.indexOf(dayBar);
+    const recent = bars.slice(Math.max(0, dayIdx - 20), dayIdx);
 
-    if (intradayBars.length === 0) {
-      // No intraday data (weekend/holiday) — use daily bar as proxy
-      const recent = bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar));
-      for (const dir of ['calls', 'puts']) {
-        const pct = ((dayBar.close - dayBar.open) / dayBar.open) * 100;
+    const intradayBars = await fetchIntradayBars5m(symbol, dayBar.date);
+    await sleep(120); // 120ms between intraday fetches — serial, no blast
+
+    if (intradayBars.length < 12) {
+      // Daily bar fallback
+      const pct = ((dayBar.close - dayBar.open) / dayBar.open) * 100;
+      if (Math.abs(pct) >= 0.8) {
+        const dir = pct > 0 ? 'calls' : 'puts';
         const opt = (dir === 'calls' ? pct : -pct) * OPTIONS_MULTIPLIER;
         const recentPcts = recent.map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
         const dailyPct   = dayBar.open > 0 ? (dayBar.high - dayBar.low) / dayBar.open : 0;
@@ -578,11 +630,10 @@ async function processCalibrationTicker(symbol, allPriors) {
       continue;
     }
 
-    const recentPcts = bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar))
-      .map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
+    const recentPcts = recent.map(b => b.open > 0 ? (b.high - b.low) / b.open : 0);
     const dailyPct   = dayBar.open > 0 ? (dayBar.high - dayBar.low) / dayBar.open : 0;
 
-    const sigs = simulateIntradaySignals(intradayBars, dayBar, bars.slice(Math.max(0, bars.indexOf(dayBar) - 20), bars.indexOf(dayBar)), adv);
+    const sigs = simulateIntradaySignals(intradayBars, dayBar, recent, adv);
     for (const sig of sigs) {
       const outcome = measureOutcome(sig, intradayBars);
       allOutcomes.push({ ...outcome, session: sig.session, direction: sig.direction, ivContext: classifyIVContext(dailyPct, recentPcts), volumeRatio: sig.volumeRatio });
@@ -623,19 +674,21 @@ async function processExpiryTicker(symbol) {
     const today  = getCTDateStr();
     const url    = `https://api.polygon.io/v3/reference/options/${encodeURIComponent(optSym)}?expiration_date.gte=${today}&limit=15&order=asc&sort=expiration_date&apiKey=${POLYGON_KEY}`;
     const data   = await polyFetch(url);
-    if (!data?.results?.length) return;
+    if (!data?.results?.length) return false;
 
     const dates = [...new Set(data.results.map(r => r.expiration_date))].sort();
 
-    await dbUpsert('expiry_cache', {
+    const ok = await dbUpsert('expiry_cache', {
       symbol:      symbol.toUpperCase(),
       dates:       dates,
       computed_at: new Date().toISOString(),
     }, ['symbol']);
 
-    console.log(`[daily-cron] EXPIRY ${symbol}: ${dates.length} dates — ${dates[0]} → ${dates[dates.length - 1]}`);
+    console.log(`[daily-cron] EXPIRY ${symbol}: ${ok ? '✅ saved' : '❌ db write failed'} — ${dates.length} dates — ${dates[0]} → ${dates[dates.length - 1]}`);
+    return ok;
   } catch (e) {
     console.error(`[daily-cron] EXPIRY ${symbol} error:`, e.message);
+    return false;
   }
 }
 
@@ -675,12 +728,23 @@ export default async function handler(req, res) {
   if (!POLYGON_KEY) {
     return res.status(500).json({ error: 'POLYGON_API_KEY not configured' });
   }
+  // FAIL LOUD: if Supabase credentials are missing, stop immediately.
+  // A missing credential causes all 33 DB writes to fail silently while the cron
+  // returns HTTP 200 — making it appear healthy in Vercel logs while writing nothing.
+  // Root cause of daily_market_data not updating since 07/12: hardcoded fallback URL was removed.
+  // Fix: add SUPABASE_URL + SUPABASE_ANON_KEY (non-VITE prefix) to Vercel env vars.
   if (!SUPABASE_URL || !SUPABASE_KEY) {
-    return res.status(500).json({ error: 'Supabase credentials not configured' });
+    console.error('[daily-cron] FATAL: SUPABASE_URL or SUPABASE_ANON_KEY not configured in Vercel env vars. All DB writes will fail. Add these env vars (without VITE_ prefix) in Vercel → Settings → Environment Variables.');
+    return res.status(500).json({ error: 'Supabase credentials not configured — add SUPABASE_URL and SUPABASE_ANON_KEY to Vercel env vars (non-VITE prefix)' });
   }
 
   const startTime = Date.now();
   const phase     = req.query.phase ?? 'all'; // 'hv', 'calibration', 'expiry', 'all'
+
+  // Clear per-run caches so a manual re-trigger never bleeds data from prior run
+  _dailyBarCache.clear();
+  globalRetryCount = 0;
+
   console.log(`[daily-cron] Starting — phase=${phase} tickers=${ALL_TICKERS.length}`);
 
   const results = { hv: { ok: 0, fail: 0 }, cal: { priors: 0 }, expiry: { ok: 0 }, errors: [] };
@@ -696,14 +760,15 @@ export default async function handler(req, res) {
         results.hv.fail++;
         results.errors.push(`HV:${sym}: ${e.message}`);
       }
-      await sleep(700); // 700ms between tickers — well within 100 req/min
+      await sleep(700); // 700ms between tickers — prevents burst, allows retry budget
     }
-    console.log(`[daily-cron] Phase A done: ${results.hv.ok} ok, ${results.hv.fail} failed`);
+    console.log(`[daily-cron] Phase A done: ${results.hv.ok} ok, ${results.hv.fail} failed. Total retries fired: ${globalRetryCount}`);
   }
 
   // ── PHASE B: Calibration priors for 13 tickers (slowest — intraday fetches) ─
   if (phase === 'all' || phase === 'calibration') {
     console.log('[daily-cron] === Phase B: Backtest Calibration ===');
+    globalRetryCount = 0; // Reset global retry budget for calibration phase
     const allPriors = [];
     for (const sym of CALIBRATION_TICKERS) {
       try {
@@ -736,6 +801,56 @@ export default async function handler(req, res) {
         await sleep(50);
       }
       results.cal.priors = allPriors.length;
+
+      // ── Stage 1 dual-write: signal_ledger (isolated — failure here never affects calibration_priors) ──
+      try {
+        const ledgerRows = allPriors.map(p => ({
+          source:      'calibration',
+          signal_type: 'calibration',
+          ticker:      p.symbol,
+          direction:   p.direction !== '*' ? p.direction : null,
+          session:     p.session  !== '*' ? p.session   : null,
+          iv_context:  p.iv_context !== '*' ? p.iv_context : null,
+          outcome:     null,
+          outcome_pct: p.win_rate_pct ?? null,
+          payload: {
+            elite_rate_pct:            p.elite_rate_pct,
+            avg_gain_pct:              p.avg_gain_pct,
+            win_rate_pct:              p.win_rate_pct,
+            avg_loss_pct:              p.avg_loss_pct,
+            sample_size:               p.sample_size,
+            sharpe_ratio:              p.sharpe_ratio,
+            optimal_volume_multiplier: p.optimal_volume_multiplier,
+            dynamic_elite_threshold:   p.dynamic_elite_threshold,
+            dynamic_target_threshold:  p.dynamic_target_threshold,
+            dynamic_base_threshold:    p.dynamic_base_threshold,
+            computed_date:             p.computed_date,
+          },
+        }));
+
+        for (let j = 0; j < ledgerRows.length; j += 50) {
+          const ledgerBatch = ledgerRows.slice(j, j + 50);
+          const ledgerUrl = `${SUPABASE_URL}/rest/v1/signal_ledger`;
+          const ledgerRes = await fetch(ledgerUrl, {
+            method:  'POST',
+            headers: {
+              'Content-Type':  'application/json',
+              'apikey':        SUPABASE_KEY,
+              'Authorization': `Bearer ${SUPABASE_KEY}`,
+              'Prefer':        'return=minimal',
+            },
+            body: JSON.stringify(ledgerBatch),
+          });
+          if (!ledgerRes.ok) {
+            console.warn(`[daily-cron] signal_ledger calibration write failed: ${ledgerRes.status} (non-critical)`);
+          }
+          await sleep(50);
+        }
+        console.log(`[daily-cron] signal_ledger: ${allPriors.length} calibration rows written`);
+      } catch (ledgerErr) {
+        // Intentionally silent — dual-write must never affect the main calibration write
+        console.warn('[daily-cron] signal_ledger dual-write skipped:', ledgerErr.message);
+      }
     }
     console.log(`[daily-cron] Phase B done: ${allPriors.length} priors written`);
   }
@@ -745,9 +860,10 @@ export default async function handler(req, res) {
     console.log('[daily-cron] === Phase C: Expiry Dates ===');
     for (const sym of ALL_TICKERS) {
       try {
-        await processExpiryTicker(sym);
-        results.expiry.ok++;
+        const ok = await processExpiryTicker(sym);
+        if (ok) results.expiry.ok++; else results.expiry.fail = (results.expiry.fail ?? 0) + 1;
       } catch (e) {
+        results.expiry.fail = (results.expiry.fail ?? 0) + 1;
         results.errors.push(`EXPIRY:${sym}: ${e.message}`);
       }
       await sleep(250);
