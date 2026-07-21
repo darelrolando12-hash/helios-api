@@ -18,23 +18,27 @@
     },
     {
       "path": "/api/snapshot-cron?window=mid",
-      "schedule": "0 17 * * 1-5"
+      "schedule": "0 18 * * 1-5"
     },
     {
       "path": "/api/snapshot-cron?window=close",
-      "schedule": "0 20 * * 1-5"
+      "schedule": "5 20 * * 1-5"
     },
     {
       "path": "/api/daily-data-cron?phase=hv",
-      "schedule": "5 21 * * 1-5"
+      "schedule": "5 22 * * 1-5"
     },
     {
       "path": "/api/daily-data-cron?phase=calibration",
-      "schedule": "15 21 * * 1-5"
+      "schedule": "15 22 * * 1-5"
     },
     {
       "path": "/api/market-intelligence-cron",
       "schedule": "* 13-21 * * 1-5"
+    },
+    {
+      "path": "/api/health-check-cron",
+      "schedule": "0 13 * * 1-5"
     }
   ],
   "headers": [
