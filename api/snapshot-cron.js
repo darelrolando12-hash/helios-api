@@ -84,11 +84,22 @@ async function fetchTickerSnapshot(symbol) {
   let spotPrevClose = ua?.day?.prev_close ?? ua?.day?.c ?? 0;
   let vwap = ua?.day?.vw ?? 0;
 
-  // Fallback spot from Polygon quote
+  // Fallback spot: use Yahoo Finance for all tickers (avoids /v2/last/trade/I:* 403 for index tickers)
   if (spot <= 0) {
-    const qtUrl = `https://api.polygon.io/v2/last/trade/${encodeURIComponent(symbol)}?apiKey=${POLYGON_KEY}`;
-    const qt = await polyFetch(qtUrl);
-    spot = qt?.results?.p ?? 0;
+    const isIndexSym = symbol === 'SPX' || symbol === 'SPXW' || symbol === 'NDX';
+    const yahooSym = isIndexSym
+      ? (symbol === 'NDX' ? '^NDX' : '^GSPC')
+      : symbol;
+    try {
+      const yRes = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1m&range=1d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(5000) }
+      );
+      if (yRes.ok) {
+        const yData = await yRes.json();
+        spot = yData?.chart?.result?.[0]?.meta?.regularMarketPrice ?? 0;
+      }
+    } catch { /* skip */ }
   }
 
   if (spot <= 0) return null; // no data — skip this ticker
@@ -150,6 +161,7 @@ async function fetchTickerSnapshot(symbol) {
     if (prev > 0 && cumGEX <= 0) { flipStrike = s.strike; break; }
   }
   if (!flipStrike && sorted.length) {
+    // fallback: strike with smallest absolute netGEX near spot
     const nearSpot = sorted.filter(s => Math.abs(s.strike - spot) < spot * 0.05);
     if (nearSpot.length) {
       flipStrike = nearSpot.reduce((best, s) => Math.abs(s.netGEX) < Math.abs(best.netGEX) ? s : best).strike;
@@ -208,6 +220,7 @@ async function fetchTickerSnapshot(symbol) {
                        (spotChangePct < -0.3 && cvdTrend === 'buying');
 
   // ── IV Rank (simple — full rank computed from DB history in snapshotStore) ──
+  // We store raw ATM IV — the rank is computed from historical snapshots later
   const ivRank = 0; // placeholder — computed by snapshotStore.getRealIVRank()
 
   return {
@@ -254,7 +267,7 @@ async function saveSnapshot(snapshot, window) {
       'Content-Type':  'application/json',
       'apikey':        SUPABASE_KEY,
       'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Prefer':        'resolution=merge-duplicates',
+      'Prefer':        'resolution=merge-duplicates', // upsert on unique constraint
     },
     body: JSON.stringify(row),
   });
